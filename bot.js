@@ -172,7 +172,7 @@ client.on("interactionCreate", async (interaction) => {
     const userId = targetUser.id;
     const guildId = interaction.guild.id;
 
-    await interaction.deferReply({ ephemeral: true });
+    await interaction.deferReply();
 
     const data = await db.getMemberData(guildId, userId);
     const member =
