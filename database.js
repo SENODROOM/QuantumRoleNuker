@@ -1,7 +1,7 @@
 require("dotenv").config();
 const mongoose = require("mongoose");
 
-let Activity, ActivityLog, LeaveLog;
+let Activity, ActivityLog, LeaveLog, Communication;
 
 async function initialize() {
   try {
@@ -42,6 +42,27 @@ async function initialize() {
     });
     LeaveLog = mongoose.model("LeaveLog", leaveLogSchema);
 
+    const communicationSchema = new mongoose.Schema(
+      {
+        guildId: String,
+        channelId: String,
+        messageId: String,
+        DiscordID: String,
+        DiscordName: String,
+        time: Date,
+        channelName: String,
+        status: {
+          type: String,
+          enum: ["active", "deleted"],
+          default: "active",
+        },
+        deletedAt: { type: Date, default: null },
+      },
+      { collection: "communication" },
+    );
+    communicationSchema.index({ guildId: 1, messageId: 1 }, { unique: true });
+    Communication = mongoose.model("Communication", communicationSchema);
+
     console.log("📦 Database initialized.");
   } catch (error) {
     console.error("Database initialization failed:", error);
@@ -67,6 +88,60 @@ async function recordActivity(guildId, userId) {
     );
   } catch (error) {
     console.error("Error recording activity:", error);
+  }
+}
+
+// ─── Track every server message in communication collection ──────────────────
+async function recordCommunication(message) {
+  if (!Communication || !message.guild || !message.author) return;
+
+  try {
+    await Communication.findOneAndUpdate(
+      { guildId: message.guild.id, messageId: message.id },
+      {
+        guildId: message.guild.id,
+        channelId: message.channel.id,
+        messageId: message.id,
+        DiscordID: message.author.id,
+        DiscordName: message.author.username,
+        time: message.createdAt || new Date(),
+        channelName: message.channel.name || null,
+        status: "active",
+        deletedAt: null,
+      },
+      { upsert: true, new: true },
+    );
+  } catch (error) {
+    console.error("Error recording communication:", error);
+  }
+}
+
+// ─── Mark a tracked message as deleted ───────────────────────────────────────
+async function markCommunicationDeleted(message) {
+  if (!Communication || !message.guild) return;
+
+  try {
+    await Communication.findOneAndUpdate(
+      { guildId: message.guild.id, messageId: message.id },
+      {
+        $set: {
+          guildId: message.guild.id,
+          channelId: message.channel?.id || null,
+          messageId: message.id,
+          channelName: message.channel?.name || null,
+          status: "deleted",
+          deletedAt: new Date(),
+        },
+        $setOnInsert: {
+          DiscordID: message.author?.id || null,
+          DiscordName: message.author?.username || null,
+          time: message.createdAt || new Date(),
+        },
+      },
+      { upsert: true, new: true },
+    );
+  } catch (error) {
+    console.error("Error marking communication deleted:", error);
   }
 }
 
@@ -356,6 +431,8 @@ async function forceSetInternSince(guildId, userId, timestamp) {
 module.exports = {
   initialize,
   recordActivity,
+  recordCommunication,
+  markCommunicationDeleted,
   getAllMembers,
   getMemberData,
   setLeave,

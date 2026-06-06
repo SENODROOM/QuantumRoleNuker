@@ -4,6 +4,7 @@ const {
   GatewayIntentBits,
   EmbedBuilder,
   PermissionsBitField,
+  Partials,
 } = require("discord.js");
 const cron = require("node-cron");
 const db = require("./database");
@@ -19,6 +20,7 @@ const client = new Client({
     GatewayIntentBits.MessageContent,
     GatewayIntentBits.GuildMessageReactions,
   ],
+  partials: [Partials.Message, Partials.Channel],
 });
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -112,7 +114,10 @@ client.on("guildMemberUpdate", async (oldMember, newMember) => {
 
 // ─── Track Message Activity ───────────────────────────────────────────────────
 client.on("messageCreate", async (message) => {
-  if (message.author.bot || !message.guild) return;
+  if (!message.guild || message.author.bot) return;
+
+  await db.recordCommunication(message);
+
   const member = message.guild.members.cache.get(message.author.id);
   if (member && isInternMember(member)) {
     // Record in bot DB (resets inactivity timer) AND mark active in main DB
@@ -122,6 +127,12 @@ client.on("messageCreate", async (message) => {
       message.author.globalName || null,
     );
   }
+});
+
+// ─── Track Deleted Messages ──────────────────────────────────────────────────
+client.on("messageDelete", async (message) => {
+  if (!message.guild) return;
+  await db.markCommunicationDeleted(message);
 });
 
 // ─── Track Voice Activity ─────────────────────────────────────────────────────
