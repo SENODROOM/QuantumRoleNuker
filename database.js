@@ -1,7 +1,20 @@
 require("dotenv").config();
 const mongoose = require("mongoose");
 
-let Activity, ActivityLog, LeaveLog, Communication;
+let Activity,
+  ActivityLog,
+  LeaveLog,
+  Communication,
+  TestMember,
+  TeamMember;
+
+function dbUriFor(dbName) {
+  const uri = process.env.MONGODB_URI || "";
+  if (/\/[^/?]+(\?|$)/.test(uri)) {
+    return uri.replace(/\/([^/?]+)(\?|$)/, `/${dbName}$2`);
+  }
+  return uri.endsWith("/") ? `${uri}${dbName}` : `${uri}/${dbName}`;
+}
 
 async function initialize() {
   try {
@@ -15,10 +28,10 @@ async function initialize() {
       userId: String,
       lastActivity: { type: Number, default: 0 },
       warningSent: { type: Boolean, default: false },
-      warnedAt: { type: Number, default: null }, // timestamp when warning was sent
+      warnedAt: { type: Number, default: null },
       leaveBalance: { type: Number, default: 0 },
       leaveStart: Number,
-      internSince: { type: Number, default: null }, // timestamp when intern role was assigned
+      internSince: { type: Number, default: null },
     });
     activitySchema.index({ guildId: 1, userId: 1 }, { unique: true });
     Activity = mongoose.model("Activity", activitySchema);
@@ -61,37 +74,137 @@ async function initialize() {
       { collection: "communication" },
     );
     communicationSchema.index({ guildId: 1, messageId: 1 }, { unique: true });
+    communicationSchema.index({ guildId: 1, DiscordID: 1, time: -1 });
     Communication = mongoose.model("Communication", communicationSchema);
 
-    console.log("📦 Database initialized.");
+    const testConn = mongoose.createConnection(dbUriFor("test"), {
+      maxPoolSize: 3,
+      serverSelectionTimeoutMS: 5000,
+    });
+
+    const testMemberSchema = new mongoose.Schema(
+      {
+        guildId: String,
+        userId: String,
+        username: String,
+        globalName: String,
+        roles: [{ id: String, name: String }],
+        savedRoles: [{ id: String, name: String }],
+        syncedAt: { type: Date, default: Date.now },
+      },
+      { collection: "members", timestamps: true },
+    );
+    testMemberSchema.index({ guildId: 1, userId: 1 }, { unique: true });
+    TestMember = testConn.model("TestMember", testMemberSchema);
+
+    const teamConn = mongoose.createConnection(dbUriFor("team"), {
+      maxPoolSize: 3,
+      serverSelectionTimeoutMS: 5000,
+    });
+
+    const teamMemberSchema = new mongoose.Schema(
+      {
+        guildId: String,
+        userId: String,
+        status: {
+          type: String,
+          enum: ["active", "inactive", "leave"],
+          default: "inactive",
+        },
+        warningCount: { type: Number, default: 0 },
+        warnedAt: { type: Number, default: null },
+        leaveEndDate: { type: String, default: null },
+      },
+      { collection: "members", timestamps: true },
+    );
+    teamMemberSchema.index({ guildId: 1, userId: 1 }, { unique: true });
+    TeamMember = teamConn.model("TeamMember", teamMemberSchema);
+
+    console.log("📦 Database initialized (test.members + team.members).");
   } catch (error) {
     console.error("Database initialization failed:", error);
   }
 }
 
-// ─── Record a member's activity ───────────────────────────────────────────────
-async function recordActivity(guildId, userId) {
-  const now = Date.now();
-  const today = getTodayString();
-
+async function upsertTestMember(guildId, userId, data) {
+  if (!TestMember) return null;
   try {
-    await Activity.findOneAndUpdate(
+    return await TestMember.findOneAndUpdate(
       { guildId, userId },
-      { lastActivity: now, warningSent: false },
+      { guildId, userId, ...data, syncedAt: new Date() },
       { upsert: true, new: true },
     );
-
-    await ActivityLog.findOneAndUpdate(
-      { guildId, userId, activityDate: today },
-      {},
-      { upsert: true },
-    );
   } catch (error) {
-    console.error("Error recording activity:", error);
+    console.error("Error upserting test member:", error);
+    return null;
   }
 }
 
-// ─── Track every server message in communication collection ──────────────────
+async function upsertTeamMember(guildId, userId, data) {
+  if (!TeamMember) return null;
+  try {
+    return await TeamMember.findOneAndUpdate(
+      { guildId, userId },
+      { guildId, userId, ...data },
+      { upsert: true, new: true },
+    );
+  } catch (error) {
+    console.error("Error upserting team member:", error);
+    return null;
+  }
+}
+
+async function getTestMember(guildId, userId) {
+  if (!TestMember) return null;
+  try {
+    return await TestMember.findOne({ guildId, userId });
+  } catch (error) {
+    console.error("Error getting test member:", error);
+    return null;
+  }
+}
+
+async function getTeamMember(guildId, userId) {
+  if (!TeamMember) return null;
+  try {
+    return await TeamMember.findOne({ guildId, userId });
+  } catch (error) {
+    console.error("Error getting team member:", error);
+    return null;
+  }
+}
+
+async function getAllTeamMembers(guildId) {
+  if (!TeamMember) return [];
+  try {
+    return await TeamMember.find({ guildId });
+  } catch (error) {
+    console.error("Error getting all team members:", error);
+    return [];
+  }
+}
+
+async function getMembersOnLeave(guildId) {
+  if (!TeamMember) return [];
+  try {
+    return await TeamMember.find({ guildId, status: "leave" });
+  } catch (error) {
+    console.error("Error getting members on leave:", error);
+    return [];
+  }
+}
+
+async function setWarning(guildId, userId, warningCount, warnedAt) {
+  return upsertTeamMember(guildId, userId, { warningCount, warnedAt });
+}
+
+async function clearWarning(guildId, userId) {
+  return upsertTeamMember(guildId, userId, {
+    warningCount: 0,
+    warnedAt: null,
+  });
+}
+
 async function recordCommunication(message) {
   if (!Communication || !message.guild || !message.author) return;
 
@@ -116,7 +229,6 @@ async function recordCommunication(message) {
   }
 }
 
-// ─── Mark a tracked message as deleted ───────────────────────────────────────
 async function markCommunicationDeleted(message) {
   if (!Communication || !message.guild) return;
 
@@ -145,7 +257,47 @@ async function markCommunicationDeleted(message) {
   }
 }
 
-// ─── Get all members for a guild ─────────────────────────────────────────────
+async function getLastCommunicationTime(guildId, userId) {
+  if (!Communication) return null;
+  try {
+    const latest = await Communication.findOne({
+      guildId: String(guildId),
+      DiscordID: String(userId),
+    })
+      .sort({ time: -1 })
+      .lean();
+
+    return latest?.time ? new Date(latest.time).getTime() : null;
+  } catch (error) {
+    console.error("Error getting last communication time:", error);
+    return null;
+  }
+}
+
+async function getLastActivityReference(guildId, userId, fallbackTimestamp) {
+  const fromCommunication = await getLastCommunicationTime(guildId, userId);
+  if (fromCommunication) return { timestamp: fromCommunication, source: "communication" };
+
+  const activity = await getMemberData(guildId, userId);
+  if (activity?.lastActivity > 0) {
+    return { timestamp: activity.lastActivity, source: "activity" };
+  }
+  if (activity?.internSince > 0) {
+    return { timestamp: activity.internSince, source: "internSince" };
+  }
+  if (fallbackTimestamp) {
+    return { timestamp: fallbackTimestamp, source: "fallback" };
+  }
+  return null;
+}
+
+async function getDaysSinceLastMessage(guildId, userId, fallbackTimestamp) {
+  const ref = await getLastActivityReference(guildId, userId, fallbackTimestamp);
+  if (!ref) return null;
+
+  return Math.floor((Date.now() - ref.timestamp) / (1000 * 60 * 60 * 24));
+}
+
 async function getAllMembers(guildId) {
   try {
     return await Activity.find({ guildId });
@@ -155,7 +307,6 @@ async function getAllMembers(guildId) {
   }
 }
 
-// ─── Get single member data ───────────────────────────────────────────────────
 async function getMemberData(guildId, userId) {
   try {
     return await Activity.findOne({ guildId, userId });
@@ -165,165 +316,56 @@ async function getMemberData(guildId, userId) {
   }
 }
 
-// ─── Set leave for a member ───────────────────────────────────────────────────
 async function setLeave(guildId, userId, days) {
   const today = getTodayString();
   const endDate = getDateStringOffset(days);
 
   try {
-    await Activity.findOneAndUpdate(
-      { guildId, userId },
-      { lastActivity: Date.now() },
-      { upsert: true },
-    );
-
     await LeaveLog.create({ guildId, userId, startDate: today, endDate });
 
     await Activity.findOneAndUpdate(
       { guildId, userId },
       { $inc: { leaveBalance: days }, leaveStart: Date.now() },
+      { upsert: true },
     );
+
+    return { startDate: today, endDate };
   } catch (error) {
     console.error("Error setting leave:", error);
+    return null;
   }
 }
 
-// ─── Mark warning as sent ─────────────────────────────────────────────────────
-async function setWarningSent(guildId, userId, value) {
+async function getActiveLeave(guildId, userId) {
   try {
-    const update = { warningSent: value };
-    if (value)
-      update.warnedAt = Date.now(); // record exactly when warning fired
-    else update.warnedAt = null; // clear on reset
-    await Activity.findOneAndUpdate({ guildId, userId }, update, {
-      upsert: true,
-    });
-  } catch (error) {
-    console.error("Error setting warning sent:", error);
-  }
-}
-
-// ─── Reset warning flag after action taken ───────────────────────────────────
-async function resetWarning(guildId, userId) {
-  try {
-    await Activity.findOneAndUpdate(
-      { guildId, userId },
-      { warningSent: false },
-    );
-  } catch (error) {
-    console.error("Error resetting warning:", error);
-  }
-}
-
-// ─── Get effective inactive days (accounting for approved leave) ──────────────
-// Logic:
-//   - Find how many calendar days have passed since last activity
-//   - Subtract any approved leave days that overlap that window
-//   - The remaining is "real" inactive days
-async function getEffectiveInactiveDays(guildId, userId) {
-  try {
-    const member = await getMemberData(guildId, userId);
-    if (!member) return 0;
-
-    // Use lastActivity if the member has ever sent a message.
-    // If lastActivity is 0/missing (never messaged), fall back to internSince
-    // so they are counted as inactive from the day they became an intern.
-    // If neither is set we cannot determine inactivity — return 0.
-    const activityTimestamp = member.lastActivity || member.internSince || 0;
-    if (!activityTimestamp) return 0;
-
-    // lastActivity = 0 means "never messaged" — we're measuring from internSince.
-    // In that case we still want to count every day since then as inactive.
-    const lastActivity = new Date(activityTimestamp);
-    const now = new Date();
-
-    // Total elapsed days since last activity
-    const totalDays = Math.floor((now - lastActivity) / (1000 * 60 * 60 * 24));
-    if (totalDays <= 0) return 0;
-
-    // Get approved leave days that fall within the inactivity window
-    const lastActivityStr = toDateString(lastActivity);
     const todayStr = getTodayString();
-
-    const leaveDays = await LeaveLog.find({
+    const leave = await LeaveLog.findOne({
       guildId,
       userId,
-      endDate: { $gte: lastActivityStr },
       startDate: { $lte: todayStr },
-    });
-
-    let coveredDays = 0;
-    for (const leave of leaveDays) {
-      const leaveStart = new Date(
-        Math.max(new Date(leave.startDate), lastActivity),
-      );
-      const leaveEnd = new Date(Math.min(new Date(leave.endDate), now));
-      if (leaveEnd > leaveStart) {
-        coveredDays += Math.floor(
-          (leaveEnd - leaveStart) / (1000 * 60 * 60 * 24),
-        );
-      }
-    }
-
-    return Math.max(0, totalDays - coveredDays);
+      endDate: { $gte: todayStr },
+    }).sort({ endDate: -1 });
+    return leave || null;
   } catch (error) {
-    console.error("Error getting effective inactive days:", error);
-    return 0;
+    console.error("Error getting active leave:", error);
+    return null;
   }
 }
 
-// ─── Get effective inactive days from a given timestamp ──────────────────────
-// Same logic as getEffectiveInactiveDays but accepts the reference timestamp
-// directly — so callers can pass the real last-message time from Discord
-// without going through lastActivity in the DB at all.
-async function getEffectiveInactiveDaysFromTimestamp(
-  guildId,
-  userId,
-  referenceTimestamp,
-) {
-  if (!referenceTimestamp) return 0;
+async function getAllActiveLeaves(guildId) {
   try {
-    const lastActivity = new Date(referenceTimestamp);
-    const now = new Date();
-
-    const totalDays = Math.floor((now - lastActivity) / (1000 * 60 * 60 * 24));
-    if (totalDays <= 0) return 0;
-
-    const lastActivityStr = toDateString(lastActivity);
     const todayStr = getTodayString();
-
-    const leaveDays = await LeaveLog.find({
+    return await LeaveLog.find({
       guildId,
-      userId,
-      endDate: { $gte: lastActivityStr },
       startDate: { $lte: todayStr },
+      endDate: { $gte: todayStr },
     });
-
-    let coveredDays = 0;
-    for (const leave of leaveDays) {
-      const leaveStart = new Date(
-        Math.max(new Date(leave.startDate), lastActivity),
-      );
-      const leaveEnd = new Date(Math.min(new Date(leave.endDate), now));
-      if (leaveEnd > leaveStart) {
-        coveredDays += Math.floor(
-          (leaveEnd - leaveStart) / (1000 * 60 * 60 * 24),
-        );
-      }
-    }
-
-    return Math.max(0, totalDays - coveredDays);
   } catch (error) {
-    console.error(
-      "Error getting effective inactive days from timestamp:",
-      error,
-    );
-    return 0;
+    console.error("Error getting all active leaves:", error);
+    return [];
   }
 }
 
-// ─── Get consecutive active days ─────────────────────────────────────────────
-// Counts backwards from today how many consecutive days they were active
 async function getConsecutiveActiveDays(guildId, userId) {
   try {
     const rows = await ActivityLog.find({ guildId, userId }).sort({
@@ -354,13 +396,12 @@ async function getConsecutiveActiveDays(guildId, userId) {
   }
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
 function getTodayString() {
   return toDateString(new Date());
 }
 
 function toDateString(date) {
-  return date.toISOString().split("T")[0]; // "YYYY-MM-DD"
+  return date.toISOString().split("T")[0];
 }
 
 function getDateStringOffset(days) {
@@ -369,12 +410,10 @@ function getDateStringOffset(days) {
   return toDateString(d);
 }
 
-// ─── Set intern start date (only sets once, never overwrites) ────────────────
-// FIXED: check internSince > 0 explicitly — 0 is stored as falsy default
 async function setInternSince(guildId, userId) {
   try {
     const member = await getMemberData(guildId, userId);
-    if (member && member.internSince > 0) return; // already set, don't overwrite
+    if (member && member.internSince > 0) return;
     await Activity.findOneAndUpdate(
       { guildId, userId },
       { internSince: Date.now() },
@@ -385,64 +424,27 @@ async function setInternSince(guildId, userId) {
   }
 }
 
-// ─── Get active leave (if member is currently on approved leave) ──────────────
-async function getActiveLeave(guildId, userId) {
-  try {
-    const todayStr = getTodayString();
-    const leave = await LeaveLog.findOne({
-      guildId,
-      userId,
-      startDate: { $lte: todayStr },
-      endDate: { $gte: todayStr },
-    }).sort({ endDate: -1 });
-    return leave || null;
-  } catch (error) {
-    console.error("Error getting active leave:", error);
-    return null;
-  }
-}
-
-// ─── Force-set lastActivity to a specific timestamp (used by /syncactivity) ──
-async function forceSetLastActivity(guildId, userId, timestamp) {
-  try {
-    await Activity.findOneAndUpdate(
-      { guildId, userId },
-      { lastActivity: timestamp, warningSent: false },
-      { upsert: true },
-    );
-  } catch (error) {
-    console.error("Error force-setting lastActivity:", error);
-  }
-}
-
-// ─── Force-set intern start date (admin override, always overwrites) ─────────
-async function forceSetInternSince(guildId, userId, timestamp) {
-  try {
-    await Activity.findOneAndUpdate(
-      { guildId, userId },
-      { internSince: timestamp },
-      { upsert: true },
-    );
-  } catch (error) {
-    console.error("Error force-setting internSince:", error);
-  }
-}
-
 module.exports = {
   initialize,
-  recordActivity,
+  upsertTestMember,
+  upsertTeamMember,
+  getTestMember,
+  getTeamMember,
+  getAllTeamMembers,
+  getMembersOnLeave,
+  setWarning,
+  clearWarning,
   recordCommunication,
   markCommunicationDeleted,
+  getLastCommunicationTime,
+  getLastActivityReference,
+  getDaysSinceLastMessage,
   getAllMembers,
   getMemberData,
   setLeave,
-  setWarningSent,
-  resetWarning,
-  getEffectiveInactiveDays,
+  getActiveLeave,
+  getAllActiveLeaves,
   getConsecutiveActiveDays,
   setInternSince,
-  forceSetInternSince,
-  forceSetLastActivity,
-  getEffectiveInactiveDaysFromTimestamp,
-  getActiveLeave,
+  getTodayString,
 };

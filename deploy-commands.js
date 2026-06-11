@@ -49,31 +49,6 @@ const commands = [
     ),
 
   new SlashCommandBuilder()
-    .setName("setintern")
-    .setDescription("[Admin] Record when a member became an intern.")
-    .addUserOption((opt) =>
-      opt.setName("user").setDescription("Target member").setRequired(true),
-    )
-    .addStringOption((opt) =>
-      opt
-        .setName("date")
-        .setDescription("Intern start date (YYYY-MM-DD). Defaults to today.")
-        .setRequired(false),
-    ),
-
-  new SlashCommandBuilder()
-    .setName("syncactivity")
-    .setDescription(
-      "[Admin] Scan message history to backfill a member's last activity timestamp.",
-    )
-    .addUserOption((opt) =>
-      opt
-        .setName("user")
-        .setDescription("Member to sync (leave blank to sync ALL interns)")
-        .setRequired(false),
-    ),
-
-  new SlashCommandBuilder()
     .setName("forcecheck")
     .setDescription(
       "[Admin] Immediately run the inactivity check (don't wait for the hourly cron).",

@@ -1,149 +1,211 @@
-# QuantumLogics Inactivity Bot
+# QuantumLogics Activity Bot
 
-A Discord bot that automatically tracks member activity, handles approved leave, and removes roles from consistently inactive members.
-
----
-
-## 🚀 Setup Guide
-
-### Step 1 — Create the Bot on Discord
-
-1. Go to https://discord.com/developers/applications and click **New Application**
-2. Name it `QuantumLogics Bot` and click **Create**
-3. Go to **Bot** in the left sidebar → click **Add Bot**
-4. Under **Privileged Gateway Intents**, enable:
-   - ✅ **Server Members Intent**
-   - ✅ **Message Content Intent**
-   - ✅ **Presence Intent**
-5. Click **Save Changes**
-6. Click **Reset Token** → copy the token (you'll need it next)
+A Discord bot for the **QuantumLogics** server that tracks intern activity, manages approved leave, syncs status with the main `quantum_logics` employee database, logs server communication, and automatically warns or removes roles from inactive interns.
 
 ---
 
-### Step 2 — Configure the Bot
+## What the Bot Does
 
-Open `config.js` and fill in:
+### Automatic activity tracking
 
-```js
-TOKEN: 'PASTE_YOUR_BOT_TOKEN_HERE',
-```
+| Event | What happens |
+| ----- | ------------ |
+| **Any member sends a message** | Message is saved to the `communication` collection (author, channel, timestamp, status). |
+| **Intern sends a message** | Inactivity timer resets, daily activity streak is recorded, and the matching employee in the main DB is marked `discordActivityStatus: active`. |
+| **Any message is deleted** | The matching `communication` record is marked `deleted` with a `deletedAt` timestamp. |
+| **Intern joins a voice channel** | Employee is marked `active` in the main DB. **Does not** reset the message-based inactivity timer. |
+| **Intern role is assigned** | `internSince` is recorded in the bot DB. Employee is marked `active` in the main DB. The inactivity clock starts from the member's **first message**, not from role assignment. |
+| **Intern role is removed** | Employee is marked `inactive` in the main DB. |
+| **New member joins** | Logged to the console only (no activity seeding). |
+| **Bot starts up** | Connects to both databases, then backfills `discordActivityStatus` for all intern employees by comparing Discord Intern role holders against `employees.discordUrl`. |
 
-Open `deploy-commands.js` and fill in:
+### Inactivity enforcement (interns only)
 
-```js
-const CLIENT_ID = "YOUR_APPLICATION_CLIENT_ID"; // Developer Portal → General Information → Application ID
-const GUILD_ID = "YOUR_GUILD_ID"; // Right-click your server in Discord → Copy Server ID
-```
+Only members with the **Intern** role are subject to warnings and role removal. Non-interns can still use `/status`, but they are never warned or stripped of roles by the cron job.
 
----
+The bot runs an **hourly check** (`0 * * * *`) and also supports manual triggers via `/forcecheck`.
 
-### Step 3 — Invite the Bot to QuantumLogics
+| Phase | Threshold | Action |
+| ----- | --------- | ------ |
+| **Safe** | Fewer than 3 effective inactive days | No action. Employee stays `active` in main DB. |
+| **Warning** | 3+ effective inactive days (`WARN_AFTER_DAYS`) | One warning embed is posted in a channel whose name contains `"announcement"`, tagging the member. `warningSent` and `warnedAt` are stored in the DB. |
+| **Grace period** | 24 hours after the warning | Member must send a message to reset the timer. Voice activity alone does not count. |
+| **Role removal** | Still inactive 24+ hours after the warning | All roles are removed **except** `@everyone`, **Intern**, and protected team roles (`AI/ML`, `Web`, `Compiler`). A removal notice is posted in announcements, the member is DMed, and the employee is marked `inactive` in the main DB. |
 
-Go to **OAuth2 → URL Generator** in the Developer Portal.
+**How inactive days are calculated**
 
-Select these scopes:
+- Based on the member's **last message** in any readable text channel (up to 300 messages per channel scanned in parallel).
+- If the member has never sent a message, the clock falls back to `internSince` (when the Intern role was assigned, or when the bot first detected them as an intern).
+- Approved leave days that overlap the inactivity window are subtracted — leave days do not count toward inactivity.
+- Sending a new message resets `lastActivity`, clears the warning flag, and stops the removal process.
 
-- `bot`
-- `applications.commands`
+**Roles that are never removed**
 
-Select these bot permissions:
-
-- Manage Roles
-- Send Messages
-- Read Message History
-- View Channels
-- Embed Links
-
-Copy the generated URL, open it in your browser, and add the bot to **QuantumLogics**.
-
-> ⚠️ Make sure the bot's role is **above** all roles it needs to manage in Server Settings → Roles.
-
----
-
-### Step 4 — Set Up MongoDB
-
-This bot uses MongoDB for data storage. Choose one:
-
-**Option A: Local MongoDB**
-
-1. Download and install MongoDB from https://www.mongodb.com/try/download/community
-2. Start MongoDB (it will run on `localhost:27017` by default)
-
-**Option B: MongoDB Atlas (Cloud)**
-
-1. Go to https://www.mongodb.com/cloud/atlas and create a free account
-2. Create a cluster and get your connection string
-3. Update the connection string in `database.js`:
-   ```js
-   await mongoose.connect("YOUR_MONGODB_CONNECTION_STRING");
-   ```
-
-### Step 5 — Install & Run
-
-```bash
-npm install
-node deploy-commands.js   # Register slash commands (run once)
-node bot.js               # Start the bot
-```
-
----
-
-## ⚙️ How It Works
-
-### Inactivity Logic
-
-| Day     | What happens                                                |
-| ------- | ----------------------------------------------------------- |
-| Day 1–2 | Nothing                                                     |
-| Day 3   | Warning posted in **#announcements** tagging the member     |
-| Day 4   | All roles removed (except protected ones) + DM sent to user |
-
-### Leave System (Smart Timer)
-
-Members can use `/leave <days>` to log planned absences.
-
-**Example:** You joined April 1st. You take 7 days leave starting April 1st. On April 10th, only **3 real days** count as inactive (April 8, 9, 10 — after leave ended). The bot correctly ignores the 7 leave days.
-
-### Protected Roles (never removed)
-
+- `Intern` (kept so tracking continues)
 - `AI/ML`
 - `Web`
 - `Compiler`
 
-To change these, edit `PROTECTED_ROLES` in `config.js`.
+Edit `PROTECTED_ROLES` in `config.js` to change the team roles.
+
+### Main database sync (`quantum_logics`)
+
+The bot connects to a **second MongoDB database** (`quantum_logics`) and updates the `employees` collection:
+
+- Matches Discord members to employees by `discordUrl` (supports `@username`, plain username, or legacy `username#1234`).
+- Tries both `member.user.username` and `member.user.globalName` for matching.
+- Sets `discordActivityStatus` to `active` or `inactive` based on Discord activity and intern role state.
+- Reads `joinedAt` from intern employee records for the **Intern Since** field in `/status`.
+
+### Message history scanning
+
+When the bot needs a member's real last message time (for `/status`, `/syncactivity`, `/forcecheck`, or the hourly cron), it scans **all viewable text channels** in parallel — up to 3 pages (300 messages) per channel — and uses the most recent message timestamp found.
 
 ---
 
-## 💬 Slash Commands
+## Slash Commands
 
-| Command                    | Who    | Description                                       |
-| -------------------------- | ------ | ------------------------------------------------- |
-| `/leave <days>`            | Anyone | Log approved leave to pause your inactivity timer |
-| `/status`                  | Anyone | Check your own activity status and leave balance  |
-| `/status @user`            | Anyone | Check another member's status                     |
-| `/resetactivity @user`     | Admin  | Manually reset a member's last activity to now    |
-| `/grantleave @user <days>` | Admin  | Grant approved leave days to a member             |
+### Member commands
+
+| Command | Description |
+| ------- | ----------- |
+| `/leave <days>` | Log approved leave (1–60 days). Leave days are excluded from the inactivity count. Also updates `lastActivity` and adds to leave balance. |
+| `/status` | Show your activity status embed. |
+| `/status @user` | Show another member's status embed. |
+
+**`/status` for non-interns** shows: last active, active-day streak, server join date, account creation date, team role, and full role list.
+
+**`/status` for interns** adds: intern since (from main DB `joinedAt`), time as intern, leave status, inactivity timer with color-coded embed, and whether a warning was already sent.
+
+### Admin commands
+
+All admin commands require the **Administrator** permission.
+
+| Command | Description |
+| ------- | ----------- |
+| `/resetactivity @user` | Manually set a member's `lastActivity` to now and clear their warning. If the target is an intern, also marks them `active` in the main DB. |
+| `/grantleave @user <days>` | Grant approved leave days to a member (same effect as them running `/leave`). |
+| `/syncactivity` | Scan Discord message history and backfill `lastActivity` for **all interns** in the server. |
+| `/syncactivity @user` | Same scan for a single member. |
+| `/forcecheck` | Backfill missing `lastActivity` / `internSince` for interns, then immediately run the full inactivity check. Useful for testing without waiting for the hourly cron. |
+| `/debuguser` | Show raw DB fields (`lastActivity`, `internSince`, `warningSent`, `warnedAt`, `leaveBalance`), effective inactive days, warn threshold, and whether an announcements channel was found. |
+| `/debuguser @user` | Debug a specific member. |
+| `/testwarn @user` | Force-send an inactivity warning embed to announcements for a user (bypasses the day threshold). Records the warning in the DB. |
 
 ---
 
-## 📁 File Structure
+## Configuration
+
+### Environment variables (`.env`)
+
+Copy `.env.example` to `.env` and fill in:
+
+```env
+DISCORD_TOKEN=your_discord_bot_token_here
+CLIENT_ID=your_discord_application_client_id
+GUILD_ID=your_discord_guild_id
+
+# Bot activity database (database.js)
+MONGODB_URI=mongodb+srv://<user>:<password>@cluster.mongodb.net/activity_bot_db
+
+# Main app database (maindb.js)
+MONGO_URI=mongodb+srv://<user>:<password>@cluster.mongodb.net/quantum_logics
+```
+
+### `config.js`
+
+| Setting | Default | Description |
+| ------- | ------- | ----------- |
+| `WARN_AFTER_DAYS` | `3` | Effective inactive days before a warning is posted. |
+| `REMOVE_ROLES_AFTER_DAYS` | `4` | Used in `/status` display for "days remaining" messaging. Actual removal happens **24 hours after the warning**, not strictly on day 4. |
+| `PROTECTED_ROLES` | `AI/ML`, `Web`, `Compiler` | Team roles never stripped during inactivity removal. |
+
+---
+
+## Setup Guide
+
+### 1. Create the bot on Discord
+
+1. Go to https://discord.com/developers/applications → **New Application**
+2. Open **Bot** → **Add Bot**
+3. Under **Privileged Gateway Intents**, enable:
+   - **Server Members Intent**
+   - **Message Content Intent**
+4. Copy the bot token into `.env` as `DISCORD_TOKEN`
+5. Copy the **Application ID** from **General Information** into `.env` as `CLIENT_ID`
+
+### 2. Invite the bot
+
+In **OAuth2 → URL Generator**, select:
+
+- Scopes: `bot`, `applications.commands`
+- Permissions: **Manage Roles**, **Send Messages**, **Read Message History**, **View Channels**, **Embed Links**
+
+Add the bot to your server. Copy the server ID (Developer Mode → right-click server → Copy Server ID) into `.env` as `GUILD_ID`.
+
+> The bot's role must be **above** every role it needs to remove in **Server Settings → Roles**.
+
+### 3. Set up MongoDB
+
+The bot uses **two** MongoDB databases:
+
+| Variable | Database | Collections used |
+| -------- | -------- | ---------------- |
+| `MONGODB_URI` | Activity bot DB | `activities`, `activitylogs`, `leavelogs`, `communication` |
+| `MONGO_URI` | `quantum_logics` | `employees` |
+
+Use local MongoDB or [MongoDB Atlas](https://www.mongodb.com/cloud/atlas). Whitelist your IP if using Atlas.
+
+### 4. Create an announcements channel
+
+Warnings and role-removal notices are posted in the first text channel whose name contains `"announcement"` (case-insensitive). Create something like `#announcements` so warnings are delivered.
+
+### 5. Install and run
+
+```bash
+npm install
+npm run deploy    # Register slash commands (run after command changes)
+npm start         # Start the bot
+```
+
+---
+
+## Data Storage
+
+### Activity bot database (`MONGODB_URI`)
+
+| Collection | Purpose |
+| ---------- | ------- |
+| `activities` | Per-member state: `lastActivity`, `internSince`, `warningSent`, `warnedAt`, `leaveBalance`, `leaveStart` |
+| `activitylogs` | One record per active day (used for consecutive-day streaks) |
+| `leavelogs` | Approved leave periods (`startDate`, `endDate`) |
+| `communication` | Every tracked message: author, channel, timestamp, active/deleted status |
+
+### Main database (`MONGO_URI`)
+
+| Collection | Fields used by bot |
+| ---------- | ------------------ |
+| `employees` | `discordUrl`, `jobTitle`, `joinedAt`, `discordActivityStatus` (`active` / `inactive`) |
+
+---
+
+## File Structure
 
 ```
-quantumlogics-bot/
-├── bot.js              # Main bot logic
-├── database.js         # MongoDB/Mongoose database layer
-├── config.js           # Your settings (token, thresholds, protected roles)
-├── deploy-commands.js  # Run once to register slash commands
+├── bot.js              # Main bot: events, slash commands, inactivity cron
+├── database.js         # Activity bot MongoDB layer
+├── maindb.js           # quantum_logics employee DB sync
+├── config.js           # Thresholds and protected roles
+├── deploy-commands.js  # Register guild slash commands
+├── .env.example        # Environment variable template
 └── package.json
 ```
 
-**Data Storage:** MongoDB collections (`Activity`, `ActivityLog`, `LeaveLog`)
-
 ---
 
-## 🔄 Keeping It Running (Optional)
+## Keeping It Running
 
-Use `pm2` to keep the bot alive 24/7:
+Use `pm2` for 24/7 uptime:
 
 ```bash
 npm install -g pm2
@@ -154,15 +216,38 @@ pm2 startup
 
 ---
 
-## 🐛 Troubleshooting
+## Troubleshooting
 
-**Bot won't start (MongoDB connection error)**
+**Bot won't start (MongoDB error)**
 
-- Ensure MongoDB is running: `mongod`
-- Check your connection string in `database.js`
-- For MongoDB Atlas, verify your IP is whitelisted and credentials are correct
+- Confirm MongoDB is running or Atlas is reachable
+- Check `MONGODB_URI` and `MONGO_URI` in `.env`
+- For Atlas, verify IP whitelist and credentials
 
-**Commands not working**
+**Commands not appearing**
 
-- Run `node deploy-commands.js` to ensure slash commands are registered
-- Check that the bot has permission to manage roles and send messages
+- Run `npm run deploy`
+- Confirm `CLIENT_ID` and `GUILD_ID` in `.env` are correct
+
+**Warnings not posting**
+
+- Ensure a channel with `"announcement"` in its name exists
+- Confirm the bot can view and send messages in that channel
+- Use `/debuguser` to verify the announcements channel is detected
+
+**Roles not being removed**
+
+- Bot role must be higher than the roles it removes
+- Bot needs **Manage Roles** permission
+- Removal only applies to members with the **Intern** role who exceeded the warning + 24h grace period
+
+**Employee not syncing to main DB**
+
+- `discordUrl` in `employees` must match the member's Discord username or display name (case-insensitive, `@` optional)
+- Use `/debuguser` and check console logs for `markActive: no match` messages
+
+**Inactivity seems wrong**
+
+- Run `/syncactivity @user` to backfill last message time from Discord history
+- Run `/forcecheck` to backfill and trigger an immediate check
+- Remember: voice joins do **not** reset the inactivity timer — only messages do
