@@ -87,35 +87,39 @@ function computeStatusFromRoles(member) {
   return hasNonProtectedRoles(member) ? "active" : "inactive";
 }
 
-// ─── Sync member into test.members + team.members ─────────────────────────────
+// ─── Sync member into test.members ────────────────────────────────────────────
 async function syncDiscordMember(member, { preserveLeave = true } = {}) {
   if (!member || member.user.bot) return;
 
   const guildId = member.guild.id;
   const userId = member.id;
   const roles = getMemberRoles(member);
-  const existingTeam = await db.getTeamMember(guildId, userId);
-  const existingTest = await db.getTestMember(guildId, userId);
-  const onLeave = existingTeam?.status === "leave";
+  const existing = await db.getMember(guildId, userId);
+  const onLeave = existing?.status === "leave";
 
-  const testPayload = {
+  const payload = {
     username: member.user.username,
     globalName: member.user.globalName || null,
     roles,
   };
-  if (onLeave && existingTest?.savedRoles?.length) {
-    testPayload.savedRoles = existingTest.savedRoles;
+
+  if (onLeave && existing?.savedRoles?.length) {
+    payload.savedRoles = existing.savedRoles;
   }
 
-  await db.upsertTestMember(guildId, userId, testPayload);
+  if (!existing) {
+    payload.status = computeStatusFromRoles(member);
+    payload.warningCount = 0;
+    payload.warnedAt = null;
+    payload.leaveEndDate = null;
+  } else if (!onLeave || !preserveLeave) {
+    const activeLeave = await db.getActiveLeave(guildId, userId);
+    if (!activeLeave) {
+      payload.status = computeStatusFromRoles(member);
+    }
+  }
 
-  if (preserveLeave && onLeave) return;
-
-  const activeLeave = await db.getActiveLeave(guildId, userId);
-  if (preserveLeave && activeLeave) return;
-
-  const status = computeStatusFromRoles(member);
-  await db.upsertTeamMember(guildId, userId, { status });
+  await db.upsertMember(guildId, userId, payload);
 }
 
 async function syncAllServerMembers(guild) {
@@ -129,7 +133,7 @@ async function syncAllServerMembers(guild) {
   }
 
   console.log(
-    `📋 Synced ${count} member(s) to test.members + team.members in "${guild.name}".`,
+    `📋 Synced ${count} member(s) to test.members in "${guild.name}".`,
   );
 }
 
@@ -138,7 +142,7 @@ async function applyLeaveToMember(guild, member, endDate) {
   const guildId = guild.id;
   const userId = member.id;
   const freshMember = await guild.members.fetch(userId);
-  const testRecord = await db.getTestMember(guildId, userId);
+  const testRecord = await db.getMember(guildId, userId);
 
   const currentRemovable = getMemberRoles(freshMember).filter(
     (r) => !isProtectedRole(r.name) && !isFutureRulesRole(r.name),
@@ -161,13 +165,13 @@ async function applyLeaveToMember(guild, member, endDate) {
   }
   savedRoles = [...merged.values()];
 
-  await db.upsertTestMember(guildId, userId, {
+  await db.upsertMember(guildId, userId, {
     username: freshMember.user.username,
     globalName: freshMember.user.globalName || null,
     savedRoles,
   });
 
-  await db.upsertTeamMember(guildId, userId, {
+  await db.upsertMember(guildId, userId, {
     status: "leave",
     leaveEndDate: endDate,
     warningCount: 0,
@@ -218,7 +222,7 @@ async function applyLeaveToMember(guild, member, endDate) {
   }
 
   const finalMember = await guild.members.fetch(userId);
-  await db.upsertTestMember(guildId, userId, {
+  await db.upsertMember(guildId, userId, {
     roles: getMemberRoles(finalMember),
     savedRoles,
   });
@@ -263,7 +267,7 @@ async function reconcileAllLeaveStates(guild) {
 async function restoreLeaveForMember(guild, member) {
   const guildId = guild.id;
   const userId = member.id;
-  const testRecord = await db.getTestMember(guildId, userId);
+  const testRecord = await db.getMember(guildId, userId);
 
   const futureRole = resolveFutureRulesRole(guild);
   if (futureRole && member.roles.cache.has(futureRole.id)) {
@@ -286,12 +290,12 @@ async function restoreLeaveForMember(guild, member) {
   const refreshed = await guild.members.fetch(userId);
   const status = computeStatusFromRoles(refreshed);
 
-  await db.upsertTestMember(guildId, userId, {
+  await db.upsertMember(guildId, userId, {
     roles: getMemberRoles(refreshed),
     savedRoles: [],
   });
 
-  await db.upsertTeamMember(guildId, userId, {
+  await db.upsertMember(guildId, userId, {
     status,
     leaveEndDate: null,
   });
@@ -346,16 +350,18 @@ client.once("ready", async () => {
 client.on("guildMemberUpdate", async (_oldMember, newMember) => {
   if (newMember.user.bot) return;
 
-  const team = await db.getTeamMember(newMember.guild.id, newMember.id);
-  if (team?.status === "leave") return;
+  const memberRecord = await db.getMember(newMember.guild.id, newMember.id);
+  if (memberRecord?.status === "leave") return;
 
   await syncDiscordMember(newMember, { preserveLeave: false });
 });
 
 client.on("guildMemberAdd", async (member) => {
   if (member.user.bot) return;
-  console.log(`👋 New member joined: ${member.user.tag}.`);
-  await syncDiscordMember(member);
+  console.log(
+    `👋 New member joined: ${member.user.tag} — recording in test.members.`,
+  );
+  await syncDiscordMember(member, { preserveLeave: false });
 });
 
 // ─── Track messages in communication collection only ─────────────────────────
@@ -364,8 +370,8 @@ client.on("messageCreate", async (message) => {
 
   await db.recordCommunication(message);
 
-  const team = await db.getTeamMember(message.guild.id, message.author.id);
-  if (team?.warningCount > 0) {
+  const memberRecord = await db.getMember(message.guild.id, message.author.id);
+  if (memberRecord?.warningCount > 0) {
     await db.clearWarning(message.guild.id, message.author.id);
     console.log(
       `💬 ${message.author.tag} responded — warning cleared.`,
@@ -421,16 +427,9 @@ client.on("interactionCreate", async (interaction) => {
       interaction.guild.members.cache.get(targetUser.id) ||
       (await interaction.guild.members.fetch(targetUser.id).catch(() => null));
 
-    const testRecord = await db.getTestMember(
-      interaction.guild.id,
-      targetUser.id,
-    );
-    const teamRecord = await db.getTeamMember(
-      interaction.guild.id,
-      targetUser.id,
-    );
+    const record = await db.getMember(interaction.guild.id, targetUser.id);
 
-    if (!member || !teamRecord) {
+    if (!member || !record) {
       return interaction.editReply({
         content: "❓ No member data found. The bot may still be syncing.",
       });
@@ -450,21 +449,19 @@ client.on("interactionCreate", async (interaction) => {
     );
 
     const roleList =
-      (testRecord?.roles || [])
-        .map((r) => `<@&${r.id}>`)
-        .join(", ") || "None";
+      (record.roles || []).map((r) => `<@&${r.id}>`).join(", ") || "None";
 
     const teamRole = getTeamRole(member);
     const statusEmoji =
-      teamRecord.status === "leave"
+      record.status === "leave"
         ? "🏖️"
-        : teamRecord.status === "active"
+        : record.status === "active"
           ? "✅"
           : "🔴";
 
     let inactivityLine;
-    if (teamRecord.status === "leave") {
-      inactivityLine = `⏸️ On leave until **${teamRecord.leaveEndDate}**`;
+    if (record.status === "leave") {
+      inactivityLine = `⏸️ On leave until **${record.leaveEndDate}**`;
     } else if (inactiveDays === null) {
       inactivityLine = "—";
     } else if (inactiveDays >= config.WARN_AFTER_DAYS) {
@@ -475,7 +472,7 @@ client.on("interactionCreate", async (interaction) => {
 
     const embed = new EmbedBuilder()
       .setColor(
-        teamRecord.status === "leave"
+        record.status === "leave"
           ? 0x00b0f4
           : inactiveDays >= config.WARN_AFTER_DAYS
             ? 0xffa500
@@ -487,7 +484,7 @@ client.on("interactionCreate", async (interaction) => {
       .addFields(
         {
           name: `${statusEmoji} Status`,
-          value: teamRecord.status,
+          value: record.status,
           inline: true,
         },
         { name: "🕐 Last Message", value: lastSeen, inline: true },
@@ -499,7 +496,7 @@ client.on("interactionCreate", async (interaction) => {
         },
         {
           name: "⚠️ Warnings",
-          value: `${teamRecord.warningCount || 0}`,
+          value: `${record.warningCount || 0}`,
           inline: true,
         },
         { name: "🎭 Roles", value: roleList, inline: false },
@@ -590,18 +587,11 @@ client.on("interactionCreate", async (interaction) => {
     const targetUser = interaction.options.getUser("user") || interaction.user;
     await interaction.deferReply({ ephemeral: true });
 
-    const testRecord = await db.getTestMember(
-      interaction.guild.id,
-      targetUser.id,
-    );
-    const teamRecord = await db.getTeamMember(
-      interaction.guild.id,
-      targetUser.id,
-    );
+    const record = await db.getMember(interaction.guild.id, targetUser.id);
 
-    if (!teamRecord) {
+    if (!record) {
       return interaction.editReply({
-        content: `❌ No team.members record for <@${targetUser.id}>.`,
+        content: `❌ No members record for <@${targetUser.id}>.`,
       });
     }
 
@@ -625,20 +615,20 @@ client.on("interactionCreate", async (interaction) => {
     await interaction.editReply({
       content:
         `**🔬 Debug for <@${targetUser.id}>**\n` +
-        `**team.members status:** ${teamRecord.status}\n` +
-        `**warningCount:** ${teamRecord.warningCount}\n` +
-        `**warnedAt:** ${fmt(teamRecord.warnedAt)}\n` +
-        `**leaveEndDate:** ${teamRecord.leaveEndDate || "none"}\n` +
+        `**status:** ${record.status}\n` +
+        `**warningCount:** ${record.warningCount}\n` +
+        `**warnedAt:** ${fmt(record.warnedAt)}\n` +
+        `**leaveEndDate:** ${record.leaveEndDate || "none"}\n` +
         `**last communication:** ${lastMsgTs ? fmt(lastMsgTs) : "none"}\n` +
         `**days since last message:** ${inactiveDays ?? "unknown"}\n` +
-        `**saved roles:** ${testRecord?.savedRoles?.length || 0}\n` +
-        `**current roles in test.members:** ${testRecord?.roles?.length || 0}\n` +
+        `**saved roles:** ${record.savedRoles?.length || 0}\n` +
+        `**current roles:** ${record.roles?.length || 0}\n` +
         `**WARN threshold:** ${config.WARN_AFTER_DAYS} days\n` +
         `**Would warn?** ${
           member &&
           hasNonProtectedRoles(member) &&
-          teamRecord.status !== "leave" &&
-          (teamRecord.warningCount || 0) === 0 &&
+          record.status !== "leave" &&
+          (record.warningCount || 0) === 0 &&
           inactiveDays !== null &&
           inactiveDays >= config.WARN_AFTER_DAYS
             ? "✅ YES"
@@ -879,8 +869,8 @@ async function checkInactivity() {
           if (member.user.bot) continue;
           if (!hasNonProtectedRoles(member)) continue;
 
-          const teamRecord = await db.getTeamMember(guild.id, member.id);
-          if (teamRecord?.status === "leave") continue;
+          const memberRecord = await db.getMember(guild.id, member.id);
+          if (memberRecord?.status === "leave") continue;
 
           const activeLeave = await db.getActiveLeave(guild.id, member.id);
           if (activeLeave) continue;
@@ -894,7 +884,7 @@ async function checkInactivity() {
             continue;
           }
 
-          const warningCount = teamRecord?.warningCount || 0;
+          const warningCount = memberRecord?.warningCount || 0;
 
           console.log(
             `🔍 ${member.user.tag} — ${inactiveDays}d inactive | warnings: ${warningCount}`,
@@ -915,8 +905,8 @@ async function checkInactivity() {
             continue;
           }
 
-          const hoursSinceWarn = teamRecord.warnedAt
-            ? (Date.now() - teamRecord.warnedAt) / (1000 * 60 * 60)
+          const hoursSinceWarn = memberRecord.warnedAt
+            ? (Date.now() - memberRecord.warnedAt) / (1000 * 60 * 60)
             : config.WARNING_GRACE_HOURS + 1;
 
           if (hoursSinceWarn >= config.WARNING_GRACE_HOURS) {
@@ -956,7 +946,7 @@ async function removeInternshipRoles(guild, member) {
   );
 
   if (rolesToRemove.size === 0) {
-    await db.upsertTeamMember(guild.id, member.id, { status: "inactive" });
+    await db.upsertMember(guild.id, member.id, { status: "inactive" });
     await mainDb.markInactive(
       member.user.username,
       member.user.globalName || null,
@@ -972,11 +962,11 @@ async function removeInternshipRoles(guild, member) {
       "Inactivity — roles removed by QuantumLogics bot",
     );
 
-    await db.upsertTestMember(guild.id, member.id, {
+    await db.upsertMember(guild.id, member.id, {
       roles: getMemberRoles(await guild.members.fetch(member.id)),
     });
 
-    await db.upsertTeamMember(guild.id, member.id, {
+    await db.upsertMember(guild.id, member.id, {
       status: "inactive",
       warningCount: 0,
       warnedAt: null,
@@ -1012,7 +1002,7 @@ async function removeInternshipRoles(guild, member) {
           },
           {
             name: "Status",
-            value: "Marked **inactive** in team.members",
+            value: "Marked **inactive** in members",
             inline: false,
           },
         )

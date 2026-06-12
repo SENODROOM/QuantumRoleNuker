@@ -5,8 +5,7 @@ let Activity,
   ActivityLog,
   LeaveLog,
   Communication,
-  TestMember,
-  TeamMember;
+  Member;
 
 function dbUriFor(dbName) {
   const uri = process.env.MONGODB_URI || "";
@@ -14,6 +13,64 @@ function dbUriFor(dbName) {
     return uri.replace(/\/([^/?]+)(\?|$)/, `/${dbName}$2`);
   }
   return uri.endsWith("/") ? `${uri}${dbName}` : `${uri}/${dbName}`;
+}
+
+async function migrateFromTeamDb() {
+  let teamConn;
+  try {
+    teamConn = mongoose.createConnection(dbUriFor("team"), {
+      maxPoolSize: 1,
+      serverSelectionTimeoutMS: 5000,
+    });
+
+    const LegacyTeamMember = teamConn.model(
+      "LegacyTeamMember",
+      new mongoose.Schema(
+        {
+          guildId: String,
+          userId: String,
+          status: String,
+          warningCount: Number,
+          warnedAt: Number,
+          leaveEndDate: String,
+        },
+        { collection: "members" },
+      ),
+    );
+
+    const legacyRecords = await LegacyTeamMember.find({});
+    if (!legacyRecords.length) return 0;
+
+    let merged = 0;
+    for (const record of legacyRecords) {
+      const result = await Member.findOneAndUpdate(
+        { guildId: record.guildId, userId: record.userId },
+        {
+          $set: {
+            status: record.status || "inactive",
+            warningCount: record.warningCount || 0,
+            warnedAt: record.warnedAt ?? null,
+            leaveEndDate: record.leaveEndDate ?? null,
+          },
+          $setOnInsert: {
+            guildId: record.guildId,
+            userId: record.userId,
+            roles: [],
+            savedRoles: [],
+          },
+        },
+        { upsert: true, new: true },
+      );
+      if (result) merged++;
+    }
+
+    return merged;
+  } catch (error) {
+    console.error("Legacy team.members migration skipped:", error.message);
+    return 0;
+  } finally {
+    if (teamConn) await teamConn.close().catch(() => {});
+  }
 }
 
 async function initialize() {
@@ -77,12 +134,12 @@ async function initialize() {
     communicationSchema.index({ guildId: 1, DiscordID: 1, time: -1 });
     Communication = mongoose.model("Communication", communicationSchema);
 
-    const testConn = mongoose.createConnection(dbUriFor("test"), {
+    const memberConn = mongoose.createConnection(dbUriFor("test"), {
       maxPoolSize: 3,
       serverSelectionTimeoutMS: 5000,
     });
 
-    const testMemberSchema = new mongoose.Schema(
+    const memberSchema = new mongoose.Schema(
       {
         guildId: String,
         userId: String,
@@ -90,22 +147,6 @@ async function initialize() {
         globalName: String,
         roles: [{ id: String, name: String }],
         savedRoles: [{ id: String, name: String }],
-        syncedAt: { type: Date, default: Date.now },
-      },
-      { collection: "members", timestamps: true },
-    );
-    testMemberSchema.index({ guildId: 1, userId: 1 }, { unique: true });
-    TestMember = testConn.model("TestMember", testMemberSchema);
-
-    const teamConn = mongoose.createConnection(dbUriFor("team"), {
-      maxPoolSize: 3,
-      serverSelectionTimeoutMS: 5000,
-    });
-
-    const teamMemberSchema = new mongoose.Schema(
-      {
-        guildId: String,
-        userId: String,
         status: {
           type: String,
           enum: ["active", "inactive", "leave"],
@@ -114,80 +155,64 @@ async function initialize() {
         warningCount: { type: Number, default: 0 },
         warnedAt: { type: Number, default: null },
         leaveEndDate: { type: String, default: null },
+        syncedAt: { type: Date, default: Date.now },
       },
       { collection: "members", timestamps: true },
     );
-    teamMemberSchema.index({ guildId: 1, userId: 1 }, { unique: true });
-    TeamMember = teamConn.model("TeamMember", teamMemberSchema);
+    memberSchema.index({ guildId: 1, userId: 1 }, { unique: true });
+    Member = memberConn.model("Member", memberSchema);
 
-    console.log("📦 Database initialized (test.members + team.members).");
+    const migrated = await migrateFromTeamDb();
+    if (migrated > 0) {
+      console.log(
+        `📦 Migrated ${migrated} record(s) from legacy team.members → test.members.`,
+      );
+    }
+
+    console.log("📦 Database initialized (test.members).");
   } catch (error) {
     console.error("Database initialization failed:", error);
   }
 }
 
-async function upsertTestMember(guildId, userId, data) {
-  if (!TestMember) return null;
+async function upsertMember(guildId, userId, data) {
+  if (!Member) return null;
   try {
-    return await TestMember.findOneAndUpdate(
+    return await Member.findOneAndUpdate(
       { guildId, userId },
       { guildId, userId, ...data, syncedAt: new Date() },
       { upsert: true, new: true },
     );
   } catch (error) {
-    console.error("Error upserting test member:", error);
+    console.error("Error upserting member:", error);
     return null;
   }
 }
 
-async function upsertTeamMember(guildId, userId, data) {
-  if (!TeamMember) return null;
+async function getMember(guildId, userId) {
+  if (!Member) return null;
   try {
-    return await TeamMember.findOneAndUpdate(
-      { guildId, userId },
-      { guildId, userId, ...data },
-      { upsert: true, new: true },
-    );
+    return await Member.findOne({ guildId, userId });
   } catch (error) {
-    console.error("Error upserting team member:", error);
+    console.error("Error getting member:", error);
     return null;
   }
 }
 
-async function getTestMember(guildId, userId) {
-  if (!TestMember) return null;
+async function getAllGuildMembers(guildId) {
+  if (!Member) return [];
   try {
-    return await TestMember.findOne({ guildId, userId });
+    return await Member.find({ guildId });
   } catch (error) {
-    console.error("Error getting test member:", error);
-    return null;
-  }
-}
-
-async function getTeamMember(guildId, userId) {
-  if (!TeamMember) return null;
-  try {
-    return await TeamMember.findOne({ guildId, userId });
-  } catch (error) {
-    console.error("Error getting team member:", error);
-    return null;
-  }
-}
-
-async function getAllTeamMembers(guildId) {
-  if (!TeamMember) return [];
-  try {
-    return await TeamMember.find({ guildId });
-  } catch (error) {
-    console.error("Error getting all team members:", error);
+    console.error("Error getting all guild members:", error);
     return [];
   }
 }
 
 async function getMembersOnLeave(guildId) {
-  if (!TeamMember) return [];
+  if (!Member) return [];
   try {
-    return await TeamMember.find({ guildId, status: "leave" });
+    return await Member.find({ guildId, status: "leave" });
   } catch (error) {
     console.error("Error getting members on leave:", error);
     return [];
@@ -195,11 +220,11 @@ async function getMembersOnLeave(guildId) {
 }
 
 async function setWarning(guildId, userId, warningCount, warnedAt) {
-  return upsertTeamMember(guildId, userId, { warningCount, warnedAt });
+  return upsertMember(guildId, userId, { warningCount, warnedAt });
 }
 
 async function clearWarning(guildId, userId) {
-  return upsertTeamMember(guildId, userId, {
+  return upsertMember(guildId, userId, {
     warningCount: 0,
     warnedAt: null,
   });
@@ -276,7 +301,9 @@ async function getLastCommunicationTime(guildId, userId) {
 
 async function getLastActivityReference(guildId, userId, fallbackTimestamp) {
   const fromCommunication = await getLastCommunicationTime(guildId, userId);
-  if (fromCommunication) return { timestamp: fromCommunication, source: "communication" };
+  if (fromCommunication) {
+    return { timestamp: fromCommunication, source: "communication" };
+  }
 
   const activity = await getMemberData(guildId, userId);
   if (activity?.lastActivity > 0) {
@@ -426,11 +453,9 @@ async function setInternSince(guildId, userId) {
 
 module.exports = {
   initialize,
-  upsertTestMember,
-  upsertTeamMember,
-  getTestMember,
-  getTeamMember,
-  getAllTeamMembers,
+  upsertMember,
+  getMember,
+  getAllGuildMembers,
   getMembersOnLeave,
   setWarning,
   clearWarning,
