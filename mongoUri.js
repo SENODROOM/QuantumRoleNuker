@@ -1,4 +1,22 @@
-const dns = require("dns").promises;
+const dns = require("dns");
+const dnsPromises = require("dns").promises;
+
+const PUBLIC_DNS = ["8.8.8.8", "1.1.1.1"];
+
+async function resolveSrvRecords(hostname) {
+  try {
+    return await dnsPromises.resolveSrv(`_mongodb._tcp.${hostname}`);
+  } catch (err) {
+    const resolver = new dns.Resolver();
+    resolver.setServers(PUBLIC_DNS);
+    return new Promise((resolve, reject) => {
+      resolver.resolveSrv(`_mongodb._tcp.${hostname}`, (error, addresses) => {
+        if (error) reject(error);
+        else resolve(addresses);
+      });
+    });
+  }
+}
 
 function buildDirectUri(creds, hosts, dbName, query) {
   const params =
@@ -23,7 +41,7 @@ async function srvUriToDirectViaDns(uri) {
   const parsed = parseSrvUri(uri);
   if (!parsed) return uri;
 
-  const records = await dns.resolveSrv(`_mongodb._tcp.${parsed.host}`);
+  const records = await resolveSrvRecords(parsed.host);
   const hosts = records.map((r) => `${r.name}:${r.port}`).join(",");
   return buildDirectUri(parsed.creds, hosts, parsed.dbName, parsed.query);
 }
@@ -46,26 +64,35 @@ function resolveMongoUri(primaryEnv, directEnv) {
 }
 
 async function resolveMongoUriAsync(primaryEnv, directEnv) {
+  const primary = process.env[primaryEnv]?.trim() || "";
   const direct = process.env[directEnv]?.trim();
+  if (!primary && direct) {
+    console.log(`[DB] Using ${directEnv}`);
+    return direct;
+  }
+  if (!primary) return "";
+
+  if (primary.startsWith("mongodb+srv://")) {
+    try {
+      const converted = await srvUriToDirectViaDns(primary);
+      console.log(`[DB] Resolved ${primaryEnv} SRV → direct shard hosts via DNS`);
+      return converted;
+    } catch (err) {
+      console.warn(`[DB] Could not resolve ${primaryEnv} SRV (${err.message}).`);
+      if (direct) {
+        console.log(`[DB] Falling back to ${directEnv}`);
+        return direct;
+      }
+      return primary;
+    }
+  }
+
   if (direct) {
     console.log(`[DB] Using ${directEnv}`);
     return direct;
   }
 
-  const primary = process.env[primaryEnv]?.trim() || "";
-  if (!primary) return "";
-  if (!primary.startsWith("mongodb+srv://")) return primary;
-
-  try {
-    const converted = await srvUriToDirectViaDns(primary);
-    console.log(`[DB] Resolved ${primaryEnv} SRV → direct shard hosts via DNS`);
-    return converted;
-  } catch (err) {
-    console.warn(
-      `[DB] Could not resolve ${primaryEnv} SRV (${err.message}). Set ${directEnv} in .env with hosts from Atlas → Connect.`,
-    );
-    return primary;
-  }
+  return primary;
 }
 
 module.exports = {

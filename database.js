@@ -15,6 +15,9 @@ async function primaryMongoUri() {
 }
 
 function dbUriFor(baseUri, dbName) {
+  if (/\/[^/?]+(\?|$)/.test(baseUri)) {
+    return baseUri.replace(/\/([^/?]+)(\?|$)/, `/${dbName}$2`);
+  }
   const qIndex = baseUri.indexOf("?");
   const base = qIndex >= 0 ? baseUri.slice(0, qIndex) : baseUri;
   const query = qIndex >= 0 ? baseUri.slice(qIndex) : "";
@@ -126,13 +129,19 @@ async function initialize() {
     });
     LeaveLog = mongoose.model("LeaveLog", leaveLogSchema);
 
+    memberConn = mongoose.createConnection(dbUriFor(mongoUri, "test"), {
+      maxPoolSize: 3,
+      serverSelectionTimeoutMS: 15000,
+      family: 4,
+    });
+    await memberConn.asPromise();
+
     const communicationSchema = new mongoose.Schema(
       {
         guildId: String,
         channelId: String,
         messageId: String,
         DiscordID: String,
-        DiscordName: String,
         time: Date,
         channelName: String,
         status: {
@@ -142,18 +151,11 @@ async function initialize() {
         },
         deletedAt: { type: Date, default: null },
       },
-      { collection: "communication" },
+      { collection: "communication", versionKey: "__v" },
     );
     communicationSchema.index({ guildId: 1, messageId: 1 }, { unique: true });
     communicationSchema.index({ guildId: 1, DiscordID: 1, time: -1 });
-    Communication = mongoose.model("Communication", communicationSchema);
-
-    memberConn = mongoose.createConnection(dbUriFor(mongoUri, "test"), {
-      maxPoolSize: 3,
-      serverSelectionTimeoutMS: 15000,
-      family: 4,
-    });
-    await memberConn.asPromise();
+    Communication = memberConn.model("Communication", communicationSchema);
 
     const memberSchema = new mongoose.Schema(
       {
@@ -174,7 +176,7 @@ async function initialize() {
         lastMessageAt: { type: Number, default: null },
         syncedAt: { type: Date, default: Date.now },
       },
-      { collection: "members", timestamps: true },
+      { collection: "members", timestamps: true, versionKey: "__v" },
     );
     memberSchema.index({ guildId: 1, userId: 1 }, { unique: true });
     Member = memberConn.model("Member", memberSchema);
@@ -187,7 +189,7 @@ async function initialize() {
     }
 
     dbReady = true;
-    console.log("📦 Database initialized (test.members).");
+    console.log("📦 Database initialized (test.members, test.communication).");
     return true;
   } catch (error) {
     dbReady = false;
@@ -260,27 +262,49 @@ async function clearWarning(guildId, userId) {
   });
 }
 
+function resolveChannelName(channel) {
+  if (!channel) return null;
+  if (channel.name) return channel.name;
+  if (typeof channel.fetch === "function") {
+    return channel.parent?.name || null;
+  }
+  return null;
+}
+
 async function recordCommunication(message) {
-  if (!Communication || !message.guild || !message.author) return;
+  if (!Communication || !message.guild || !message.author) {
+    if (!Communication) {
+      console.error("Error recording communication: test.communication model not ready");
+    }
+    return false;
+  }
 
   try {
+    const channel =
+      message.channel?.partial && typeof message.channel.fetch === "function"
+        ? await message.channel.fetch()
+        : message.channel;
+
     await Communication.findOneAndUpdate(
       { guildId: message.guild.id, messageId: message.id },
       {
-        guildId: message.guild.id,
-        channelId: message.channel.id,
-        messageId: message.id,
-        DiscordID: message.author.id,
-        DiscordName: message.author.username,
-        time: message.createdAt || new Date(),
-        channelName: message.channel.name || null,
-        status: "active",
-        deletedAt: null,
+        $set: {
+          guildId: message.guild.id,
+          channelId: channel?.id || message.channelId,
+          messageId: message.id,
+          DiscordID: message.author.id,
+          time: message.createdAt || new Date(),
+          channelName: resolveChannelName(channel),
+          status: "active",
+          deletedAt: null,
+        },
       },
       { upsert: true, new: true },
     );
+    return true;
   } catch (error) {
-    console.error("Error recording communication:", error);
+    console.error("Error recording communication:", error.message);
+    return false;
   }
 }
 
@@ -301,7 +325,6 @@ async function markCommunicationDeleted(message) {
         },
         $setOnInsert: {
           DiscordID: message.author?.id || null,
-          DiscordName: message.author?.username || null,
           time: message.createdAt || new Date(),
         },
       },
@@ -318,6 +341,7 @@ async function getLastCommunicationTime(guildId, userId) {
     const latest = await Communication.findOne({
       guildId: String(guildId),
       DiscordID: String(userId),
+      status: "active",
     })
       .sort({ time: -1 })
       .lean();
@@ -329,32 +353,11 @@ async function getLastCommunicationTime(guildId, userId) {
   }
 }
 
-async function getLastKnownMessageTimestamp(guildId, userId) {
-  const member = await getMember(guildId, userId);
-  if (member?.lastMessageAt > 0) {
-    return { timestamp: member.lastMessageAt, source: "member" };
-  }
-
-  const fromCommunication = await getLastCommunicationTime(guildId, userId);
-  if (fromCommunication) {
-    return { timestamp: fromCommunication, source: "communication" };
-  }
-
-  if (!Activity) return null;
-
-  const activity = await getMemberData(guildId, userId);
-  if (activity?.lastActivity > 0) {
-    return { timestamp: activity.lastActivity, source: "activity" };
-  }
-
-  return null;
-}
-
 async function getDaysSinceLastMessage(guildId, userId) {
-  const ref = await getLastKnownMessageTimestamp(guildId, userId);
-  if (!ref) return null;
+  const lastActive = await getLastCommunicationTime(guildId, userId);
+  if (!lastActive) return null;
 
-  return Math.floor((Date.now() - ref.timestamp) / (1000 * 60 * 60 * 24));
+  return Math.floor((Date.now() - lastActive) / (1000 * 60 * 60 * 24));
 }
 
 async function getAllMembers(guildId) {
@@ -503,7 +506,6 @@ module.exports = {
   recordCommunication,
   markCommunicationDeleted,
   getLastCommunicationTime,
-  getLastKnownMessageTimestamp,
   getDaysSinceLastMessage,
   getAllMembers,
   getMemberData,

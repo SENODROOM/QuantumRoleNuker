@@ -330,18 +330,9 @@ async function syncAllLeaveLogs() {
 client.once("ready", async () => {
   console.log(`✅ QuantumLogics Bot is online as ${client.user.tag}`);
 
-  try {
-    await db.initialize();
-    await mainDb.initMainDb();
-  } catch (err) {
-    console.error("❌ Startup failed — database not ready:", err.message);
-    process.exit(1);
-  }
-
   for (const guild of client.guilds.cache.values()) {
     await syncAllServerMembers(guild);
     await syncLeaveLogsFromDb(guild);
-    await backfillMemberLastMessages(guild);
   }
 
   startInactivityChecker();
@@ -369,18 +360,25 @@ client.on("guildMemberAdd", async (member) => {
   await syncDiscordMember(member, { preserveLeave: false });
 });
 
-// ─── Track messages in communication collection only ─────────────────────────
+// ─── Track messages in test.communication ────────────────────────────────────
 client.on("messageCreate", async (message) => {
-  if (!message.guild || message.author.bot || !db.isReady()) return;
+  if (!message.guild || message.author.bot) return;
+  if (!db.isReady()) {
+    console.warn("⚠️ Message ignored — database is not ready yet.");
+    return;
+  }
 
-  const timestamp = message.createdTimestamp || Date.now();
-  await db.recordCommunication(message);
-  await db.setLastMessageAt(message.guild.id, message.author.id, timestamp);
-
+  const saved = await db.recordCommunication(message);
+  if (!saved) {
+    console.error(
+      `❌ Failed to save message ${message.id} from ${message.author.tag} to test.communication`,
+    );
+    return;
+  }
   const memberRecord = await db.getMember(message.guild.id, message.author.id);
   if (memberRecord?.warningCount > 0) {
     await db.clearWarning(message.guild.id, message.author.id);
-    console.log(`💬 ${message.author.tag} responded — warning cleared.`);
+    console.log(`💬 ${message.author.tag} messaged — warning cleared.`);
   }
 });
 
@@ -796,74 +794,8 @@ async function resolveWarningsChannel(guild) {
   return channel;
 }
 
-// ─── Scan Discord history when communication DB has no record ────────────────
-async function scanLastMessage(guild, userId) {
-  const textChannels = [...guild.channels.cache.values()].filter(
-    (c) => c.isTextBased() && c.viewable,
-  );
-
-  async function scanChannel(channel) {
-    try {
-      let lastId = null;
-      for (let page = 0; page < config.MESSAGE_SCAN_PAGES; page++) {
-        const options = { limit: 100 };
-        if (lastId) options.before = lastId;
-        const messages = await channel.messages.fetch(options);
-        if (messages.size === 0) break;
-        const userMsg = messages.find((m) => m.author.id === userId);
-        if (userMsg) return userMsg.createdTimestamp;
-        lastId = messages.last().id;
-      }
-    } catch {
-      /* skip channels without read access */
-    }
-    return null;
-  }
-
-  const timestamps = await Promise.all(textChannels.map(scanChannel));
-  const valid = timestamps.filter(Boolean);
-  return valid.length ? Math.max(...valid) : null;
-}
-
 async function getInactiveDays(guild, member) {
-  let inactiveDays = await db.getDaysSinceLastMessage(guild.id, member.id);
-
-  const scanned = await scanLastMessage(guild, member.id);
-  if (scanned) {
-    await db.setLastMessageAt(guild.id, member.id, scanned);
-    const scannedDays = Math.floor(
-      (Date.now() - scanned) / (1000 * 60 * 60 * 24),
-    );
-    if (inactiveDays === null || scannedDays < inactiveDays) {
-      inactiveDays = scannedDays;
-    }
-  }
-
-  return inactiveDays;
-}
-
-async function backfillMemberLastMessages(guild) {
-  let updated = 0;
-
-  for (const member of guild.members.cache.values()) {
-    if (member.user.bot || !hasNonProtectedRoles(member)) continue;
-    if (isInactivityExempt(member)) continue;
-
-    const existing = await db.getMember(guild.id, member.id);
-    if (existing?.lastMessageAt > 0) continue;
-
-    const scanned = await scanLastMessage(guild, member.id);
-    if (!scanned) continue;
-
-    await db.setLastMessageAt(guild.id, member.id, scanned);
-    updated++;
-  }
-
-  if (updated > 0) {
-    console.log(
-      `📝 Backfilled lastMessageAt for ${updated} member(s) in "${guild.name}".`,
-    );
-  }
+  return db.getDaysSinceLastMessage(guild.id, member.id);
 }
 
 // ─── Inactivity checker ───────────────────────────────────────────────────────
@@ -905,6 +837,7 @@ async function checkInactivity() {
 
           const memberRecord = await db.getMember(guild.id, member.id);
           if (memberRecord?.status === "leave") continue;
+          if (memberRecord?.status === "inactive") continue;
 
           const activeLeave = await db.getActiveLeave(guild.id, member.id);
           if (activeLeave) continue;
@@ -921,7 +854,7 @@ async function checkInactivity() {
           const warningCount = memberRecord?.warningCount || 0;
 
           console.log(
-            `🔍 ${member.user.tag} — ${inactiveDays}d inactive | warnings: ${warningCount}`,
+            `🔍 ${member.user.tag} — ${inactiveDays}d since last active msg (test.communication) | warnings: ${warningCount}`,
           );
 
           if (warningCount === 0) {
@@ -947,22 +880,21 @@ async function checkInactivity() {
             continue;
           }
 
+          if (warningCount > 1) continue;
+
           const hoursSinceWarn = memberRecord.warnedAt
             ? (Date.now() - memberRecord.warnedAt) / (1000 * 60 * 60)
             : config.WARNING_GRACE_HOURS + 1;
 
-          if (hoursSinceWarn >= config.WARNING_GRACE_HOURS) {
-            const stillInactive = await getInactiveDays(guild, member);
+          if (hoursSinceWarn < config.WARNING_GRACE_HOURS) continue;
 
-            if (
-              stillInactive !== null &&
-              stillInactive >= config.WARN_AFTER_DAYS
-            ) {
-              await removeInternshipRoles(guild, member);
-              removed++;
-            }
-
-            await db.clearWarning(guild.id, member.id);
+          const stillInactive = await getInactiveDays(guild, member);
+          if (
+            stillInactive !== null &&
+            stillInactive >= config.WARN_AFTER_DAYS
+          ) {
+            await removeInternshipRoles(guild, member);
+            removed++;
           }
         } catch (memberErr) {
           errors++;
@@ -987,28 +919,19 @@ async function removeInternshipRoles(guild, member) {
     (role) => role.name !== "@everyone" && !isProtectedRole(role.name),
   );
 
-  if (rolesToRemove.size === 0) {
-    await db.upsertMember(guild.id, member.id, { status: "inactive" });
-    await mainDb.markInactive(
-      member.user.username,
-      member.user.globalName || null,
-    );
-    return;
-  }
-
   const removedRoleNames = rolesToRemove.map((r) => r.name).join(", ");
 
   try {
-    await member.roles.remove(
-      rolesToRemove,
-      "Inactivity — roles removed by QuantumLogics bot",
-    );
+    if (rolesToRemove.size > 0) {
+      await member.roles.remove(
+        rolesToRemove,
+        "Inactivity — roles removed by QuantumLogics bot",
+      );
+    }
 
+    const updatedMember = await guild.members.fetch(member.id);
     await db.upsertMember(guild.id, member.id, {
-      roles: getMemberRoles(await guild.members.fetch(member.id)),
-    });
-
-    await db.upsertMember(guild.id, member.id, {
+      roles: getMemberRoles(updatedMember),
       status: "inactive",
       warningCount: 0,
       warnedAt: null,
@@ -1020,56 +943,8 @@ async function removeInternshipRoles(guild, member) {
     );
 
     console.log(
-      `🔴 Removed roles from ${member.user.tag}: ${removedRoleNames}`,
+      `🔴 Silently removed roles from ${member.user.tag}: ${removedRoleNames || "none"} — status set to inactive`,
     );
-
-    const channel = await resolveWarningsChannel(guild);
-    if (channel) {
-      const removalEmbed = new EmbedBuilder()
-        .setColor(0x992d22)
-        .setTitle("🔴 Roles Removed — Inactivity")
-        .setDescription(
-          `${member} did not respond within **24 hours** of their inactivity warning.`,
-        )
-        .addFields(
-          {
-            name: "Roles Removed",
-            value: removedRoleNames || "None",
-            inline: false,
-          },
-          {
-            name: "Protected Roles Kept",
-            value: config.PROTECTED_ROLES.join(", "),
-            inline: false,
-          },
-          {
-            name: "Status",
-            value: "Marked **inactive** in members",
-            inline: false,
-          },
-        )
-        .setFooter({ text: "QuantumLogics Activity System" })
-        .setTimestamp();
-
-      await channel.send({ embeds: [removalEmbed] });
-    }
-
-    const dmEmbed = new EmbedBuilder()
-      .setColor(0x992d22)
-      .setTitle("🔴 Your Roles Have Been Removed")
-      .setDescription(
-        `Hi **${member.user.username}**,\n\n` +
-          "You did not respond within 24 hours of your inactivity warning.\n\n" +
-          `**Roles removed:** ${removedRoleNames}\n\n` +
-          `**Protected roles kept:** ${config.PROTECTED_ROLES.join(", ")}\n\n` +
-          "Contact an admin to get your roles back, or use `/leave` before future absences.",
-      )
-      .setFooter({ text: "QuantumLogics Activity System" })
-      .setTimestamp();
-
-    await member.send({ embeds: [dmEmbed] }).catch(() => {
-      console.log(`📵 Could not DM ${member.user.tag}.`);
-    });
   } catch (err) {
     console.error(
       `Failed to remove roles from ${member.user.tag}:`,
@@ -1078,4 +953,16 @@ async function removeInternshipRoles(guild, member) {
   }
 }
 
-client.login(config.TOKEN);
+async function start() {
+  try {
+    await db.initialize();
+    await mainDb.initMainDb();
+  } catch (err) {
+    console.error("❌ Startup failed — database not ready:", err.message);
+    process.exit(1);
+  }
+
+  await client.login(config.TOKEN);
+}
+
+start();
