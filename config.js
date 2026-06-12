@@ -16,4 +16,13 @@ module.exports = {
 
   // ── #qubit-warnings channel ────────────────────────────────────────────────
   WARNINGS_CHANNEL_ID: "1514355734236626944",
+
+  // Discord user IDs never checked for inactivity (comma-separated in .env)
+  EXEMPT_USER_IDS: (process.env.EXEMPT_USER_IDS || "")
+    .split(",")
+    .map((id) => id.trim())
+    .filter(Boolean),
+
+  // How many message pages to scan per channel when backfilling activity
+  MESSAGE_SCAN_PAGES: 10,
 };

@@ -87,6 +87,13 @@ function computeStatusFromRoles(member) {
   return hasNonProtectedRoles(member) ? "active" : "inactive";
 }
 
+function isInactivityExempt(member) {
+  if (!member) return true;
+  if (config.EXEMPT_USER_IDS.includes(member.id)) return true;
+  if (member.permissions.has(PermissionsBitField.Flags.Administrator)) return true;
+  return false;
+}
+
 // ─── Sync member into test.members ────────────────────────────────────────────
 async function syncDiscordMember(member, { preserveLeave = true } = {}) {
   if (!member || member.user.bot) return;
@@ -317,12 +324,19 @@ async function syncAllLeaveLogs() {
 // ─── On Ready ────────────────────────────────────────────────────────────────
 client.once("ready", async () => {
   console.log(`✅ QuantumLogics Bot is online as ${client.user.tag}`);
-  await db.initialize();
-  await mainDb.initMainDb();
+
+  try {
+    await db.initialize();
+    await mainDb.initMainDb();
+  } catch (err) {
+    console.error("❌ Startup failed — database not ready:", err.message);
+    process.exit(1);
+  }
 
   for (const guild of client.guilds.cache.values()) {
     await syncAllServerMembers(guild);
     await syncLeaveLogsFromDb(guild);
+    await backfillMemberLastMessages(guild);
   }
 
   startInactivityChecker();
@@ -352,16 +366,16 @@ client.on("guildMemberAdd", async (member) => {
 
 // ─── Track messages in communication collection only ─────────────────────────
 client.on("messageCreate", async (message) => {
-  if (!message.guild || message.author.bot) return;
+  if (!message.guild || message.author.bot || !db.isReady()) return;
 
+  const timestamp = message.createdTimestamp || Date.now();
   await db.recordCommunication(message);
+  await db.setLastMessageAt(message.guild.id, message.author.id, timestamp);
 
   const memberRecord = await db.getMember(message.guild.id, message.author.id);
   if (memberRecord?.warningCount > 0) {
     await db.clearWarning(message.guild.id, message.author.id);
-    console.log(
-      `💬 ${message.author.tag} responded — warning cleared.`,
-    );
+    console.log(`💬 ${message.author.tag} responded — warning cleared.`);
   }
 });
 
@@ -427,11 +441,7 @@ client.on("interactionCreate", async (interaction) => {
     const lastSeen = lastMsgTs
       ? `<t:${Math.floor(lastMsgTs / 1000)}:R>`
       : "No messages recorded";
-    const inactiveDays = await db.getDaysSinceLastMessage(
-      interaction.guild.id,
-      targetUser.id,
-      member.joinedTimestamp,
-    );
+    const inactiveDays = await getInactiveDays(interaction.guild, member);
 
     const roleList =
       (record.roles || []).map((r) => `<@&${r.id}>`).join(", ") || "None";
@@ -588,11 +598,9 @@ client.on("interactionCreate", async (interaction) => {
       interaction.guild.id,
       targetUser.id,
     );
-    const inactiveDays = await db.getDaysSinceLastMessage(
-      interaction.guild.id,
-      targetUser.id,
-      null,
-    );
+    const inactiveDays = member
+      ? await getInactiveDays(interaction.guild, member)
+      : null;
 
     const fmt = (ts) =>
       ts ? `<t:${Math.floor(ts / 1000)}:F> (raw: ${ts})` : `null`;
@@ -792,7 +800,7 @@ async function scanLastMessage(guild, userId) {
   async function scanChannel(channel) {
     try {
       let lastId = null;
-      for (let page = 0; page < 3; page++) {
+      for (let page = 0; page < config.MESSAGE_SCAN_PAGES; page++) {
         const options = { limit: 100 };
         if (lastId) options.before = lastId;
         const messages = await channel.messages.fetch(options);
@@ -813,20 +821,44 @@ async function scanLastMessage(guild, userId) {
 }
 
 async function getInactiveDays(guild, member) {
-  let inactiveDays = await db.getDaysSinceLastMessage(
-    guild.id,
-    member.id,
-    member.joinedTimestamp,
-  );
+  let inactiveDays = await db.getDaysSinceLastMessage(guild.id, member.id);
 
-  if (inactiveDays === null) {
-    const scanned = await scanLastMessage(guild, member.id);
-    if (scanned) {
-      inactiveDays = Math.floor((Date.now() - scanned) / (1000 * 60 * 60 * 24));
+  const scanned = await scanLastMessage(guild, member.id);
+  if (scanned) {
+    await db.setLastMessageAt(guild.id, member.id, scanned);
+    const scannedDays = Math.floor(
+      (Date.now() - scanned) / (1000 * 60 * 60 * 24),
+    );
+    if (inactiveDays === null || scannedDays < inactiveDays) {
+      inactiveDays = scannedDays;
     }
   }
 
   return inactiveDays;
+}
+
+async function backfillMemberLastMessages(guild) {
+  let updated = 0;
+
+  for (const member of guild.members.cache.values()) {
+    if (member.user.bot || !hasNonProtectedRoles(member)) continue;
+    if (isInactivityExempt(member)) continue;
+
+    const existing = await db.getMember(guild.id, member.id);
+    if (existing?.lastMessageAt > 0) continue;
+
+    const scanned = await scanLastMessage(guild, member.id);
+    if (!scanned) continue;
+
+    await db.setLastMessageAt(guild.id, member.id, scanned);
+    updated++;
+  }
+
+  if (updated > 0) {
+    console.log(
+      `📝 Backfilled lastMessageAt for ${updated} member(s) in "${guild.name}".`,
+    );
+  }
 }
 
 // ─── Inactivity checker ───────────────────────────────────────────────────────
@@ -845,6 +877,11 @@ function startInactivityChecker() {
 }
 
 async function checkInactivity() {
+  if (!db.isReady()) {
+    console.warn("⏰ Skipping inactivity check — database is not ready.");
+    return;
+  }
+
   for (const guild of client.guilds.cache.values()) {
     try {
       await guild.members.fetch();
@@ -858,6 +895,7 @@ async function checkInactivity() {
       for (const member of guild.members.cache.values()) {
         try {
           if (member.user.bot) continue;
+          if (isInactivityExempt(member)) continue;
           if (!hasNonProtectedRoles(member)) continue;
 
           const memberRecord = await db.getMember(guild.id, member.id);
@@ -884,7 +922,15 @@ async function checkInactivity() {
           if (warningCount === 0) {
             try {
               await sendInactivityWarning(guild, member, { inactiveDays });
-              await db.setWarning(guild.id, member.id, 1, Date.now());
+              const saved = await db.setWarning(
+                guild.id,
+                member.id,
+                1,
+                Date.now(),
+              );
+              if (!saved) {
+                throw new Error("Failed to persist warning in test.members");
+              }
               warned++;
             } catch (warnErr) {
               errors++;

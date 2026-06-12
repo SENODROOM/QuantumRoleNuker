@@ -5,10 +5,18 @@ let Activity,
   ActivityLog,
   LeaveLog,
   Communication,
-  Member;
+  Member,
+  memberConn;
+let dbReady = false;
+
+function primaryMongoUri() {
+  const direct = process.env.MONGODB_URI_DIRECT?.trim();
+  if (direct) return direct;
+  return process.env.MONGODB_URI?.trim() || "";
+}
 
 function dbUriFor(dbName) {
-  const uri = process.env.MONGODB_URI || "";
+  const uri = primaryMongoUri();
   if (/\/[^/?]+(\?|$)/.test(uri)) {
     return uri.replace(/\/([^/?]+)(\?|$)/, `/${dbName}$2`);
   }
@@ -74,10 +82,23 @@ async function migrateFromTeamDb() {
 }
 
 async function initialize() {
+  dbReady = false;
+  const mongoUri = primaryMongoUri();
+  if (!mongoUri) {
+    throw new Error("MONGODB_URI is not set.");
+  }
+
+  if (mongoUri.startsWith("mongodb+srv://") && !process.env.MONGODB_URI_DIRECT) {
+    console.warn(
+      "[DB] Using mongodb+srv. If you see querySrv ECONNREFUSED, set MONGODB_URI_DIRECT in .env.",
+    );
+  }
+
   try {
-    await mongoose.connect(process.env.MONGODB_URI, {
+    await mongoose.connect(mongoUri, {
       maxPoolSize: 3,
-      serverSelectionTimeoutMS: 5000,
+      serverSelectionTimeoutMS: 15000,
+      family: 4,
     });
 
     const activitySchema = new mongoose.Schema({
@@ -134,10 +155,12 @@ async function initialize() {
     communicationSchema.index({ guildId: 1, DiscordID: 1, time: -1 });
     Communication = mongoose.model("Communication", communicationSchema);
 
-    const memberConn = mongoose.createConnection(dbUriFor("test"), {
+    memberConn = mongoose.createConnection(dbUriFor("test"), {
       maxPoolSize: 3,
-      serverSelectionTimeoutMS: 5000,
+      serverSelectionTimeoutMS: 15000,
+      family: 4,
     });
+    await memberConn.asPromise();
 
     const memberSchema = new mongoose.Schema(
       {
@@ -155,6 +178,7 @@ async function initialize() {
         warningCount: { type: Number, default: 0 },
         warnedAt: { type: Number, default: null },
         leaveEndDate: { type: String, default: null },
+        lastMessageAt: { type: Number, default: null },
         syncedAt: { type: Date, default: Date.now },
       },
       { collection: "members", timestamps: true },
@@ -169,10 +193,23 @@ async function initialize() {
       );
     }
 
+    dbReady = true;
     console.log("📦 Database initialized (test.members).");
+    return true;
   } catch (error) {
-    console.error("Database initialization failed:", error);
+    dbReady = false;
+    console.error("Database initialization failed:", error.message);
+    throw error;
   }
+}
+
+function isReady() {
+  return dbReady;
+}
+
+async function setLastMessageAt(guildId, userId, timestamp) {
+  if (!Member || !timestamp) return null;
+  return upsertMember(guildId, userId, { lastMessageAt: timestamp });
 }
 
 async function upsertMember(guildId, userId, data) {
@@ -299,33 +336,36 @@ async function getLastCommunicationTime(guildId, userId) {
   }
 }
 
-async function getLastActivityReference(guildId, userId, fallbackTimestamp) {
+async function getLastKnownMessageTimestamp(guildId, userId) {
+  const member = await getMember(guildId, userId);
+  if (member?.lastMessageAt > 0) {
+    return { timestamp: member.lastMessageAt, source: "member" };
+  }
+
   const fromCommunication = await getLastCommunicationTime(guildId, userId);
   if (fromCommunication) {
     return { timestamp: fromCommunication, source: "communication" };
   }
 
+  if (!Activity) return null;
+
   const activity = await getMemberData(guildId, userId);
   if (activity?.lastActivity > 0) {
     return { timestamp: activity.lastActivity, source: "activity" };
   }
-  if (activity?.internSince > 0) {
-    return { timestamp: activity.internSince, source: "internSince" };
-  }
-  if (fallbackTimestamp) {
-    return { timestamp: fallbackTimestamp, source: "fallback" };
-  }
+
   return null;
 }
 
-async function getDaysSinceLastMessage(guildId, userId, fallbackTimestamp) {
-  const ref = await getLastActivityReference(guildId, userId, fallbackTimestamp);
+async function getDaysSinceLastMessage(guildId, userId) {
+  const ref = await getLastKnownMessageTimestamp(guildId, userId);
   if (!ref) return null;
 
   return Math.floor((Date.now() - ref.timestamp) / (1000 * 60 * 60 * 24));
 }
 
 async function getAllMembers(guildId) {
+  if (!Activity) return [];
   try {
     return await Activity.find({ guildId });
   } catch (error) {
@@ -335,6 +375,7 @@ async function getAllMembers(guildId) {
 }
 
 async function getMemberData(guildId, userId) {
+  if (!Activity) return null;
   try {
     return await Activity.findOne({ guildId, userId });
   } catch (error) {
@@ -344,6 +385,8 @@ async function getMemberData(guildId, userId) {
 }
 
 async function setLeave(guildId, userId, days) {
+  if (!LeaveLog || !Activity) return null;
+
   const today = getTodayString();
   const endDate = getDateStringOffset(days);
 
@@ -364,6 +407,7 @@ async function setLeave(guildId, userId, days) {
 }
 
 async function getActiveLeave(guildId, userId) {
+  if (!LeaveLog) return null;
   try {
     const todayStr = getTodayString();
     const leave = await LeaveLog.findOne({
@@ -380,6 +424,7 @@ async function getActiveLeave(guildId, userId) {
 }
 
 async function getAllActiveLeaves(guildId) {
+  if (!LeaveLog) return [];
   try {
     const todayStr = getTodayString();
     return await LeaveLog.find({
@@ -394,6 +439,7 @@ async function getAllActiveLeaves(guildId) {
 }
 
 async function getConsecutiveActiveDays(guildId, userId) {
+  if (!ActivityLog) return 0;
   try {
     const rows = await ActivityLog.find({ guildId, userId }).sort({
       activityDate: -1,
@@ -453,7 +499,9 @@ async function setInternSince(guildId, userId) {
 
 module.exports = {
   initialize,
+  isReady,
   upsertMember,
+  setLastMessageAt,
   getMember,
   getAllGuildMembers,
   getMembersOnLeave,
@@ -462,7 +510,7 @@ module.exports = {
   recordCommunication,
   markCommunicationDeleted,
   getLastCommunicationTime,
-  getLastActivityReference,
+  getLastKnownMessageTimestamp,
   getDaysSinceLastMessage,
   getAllMembers,
   getMemberData,
