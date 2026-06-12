@@ -1,6 +1,6 @@
 require("dotenv").config();
 const mongoose = require("mongoose");
-const { resolveMongoUri } = require("./mongoUri");
+const { resolveMongoUriAsync } = require("./mongoUri");
 
 let Activity,
   ActivityLog,
@@ -10,22 +10,22 @@ let Activity,
   memberConn;
 let dbReady = false;
 
-function primaryMongoUri() {
-  return resolveMongoUri("MONGODB_URI", "MONGODB_URI_DIRECT");
+async function primaryMongoUri() {
+  return resolveMongoUriAsync("MONGODB_URI", "MONGODB_URI_DIRECT");
 }
 
-function dbUriFor(dbName) {
-  const uri = primaryMongoUri();
-  if (/\/[^/?]+(\?|$)/.test(uri)) {
-    return uri.replace(/\/([^/?]+)(\?|$)/, `/${dbName}$2`);
-  }
-  return uri.endsWith("/") ? `${uri}${dbName}` : `${uri}/${dbName}`;
+function dbUriFor(baseUri, dbName) {
+  const qIndex = baseUri.indexOf("?");
+  const base = qIndex >= 0 ? baseUri.slice(0, qIndex) : baseUri;
+  const query = qIndex >= 0 ? baseUri.slice(qIndex) : "";
+  const normalized = base.replace(/\/$/, "");
+  return `${normalized}/${dbName}${query}`;
 }
 
-async function migrateFromTeamDb() {
+async function migrateFromTeamDb(baseUri) {
   let teamConn;
   try {
-    teamConn = mongoose.createConnection(dbUriFor("team"), {
+    teamConn = mongoose.createConnection(dbUriFor(baseUri, "team"), {
       maxPoolSize: 1,
       serverSelectionTimeoutMS: 5000,
     });
@@ -82,7 +82,7 @@ async function migrateFromTeamDb() {
 
 async function initialize() {
   dbReady = false;
-  const mongoUri = primaryMongoUri();
+  const mongoUri = await primaryMongoUri();
   if (!mongoUri) {
     throw new Error("MONGODB_URI is not set.");
   }
@@ -148,7 +148,7 @@ async function initialize() {
     communicationSchema.index({ guildId: 1, DiscordID: 1, time: -1 });
     Communication = mongoose.model("Communication", communicationSchema);
 
-    memberConn = mongoose.createConnection(dbUriFor("test"), {
+    memberConn = mongoose.createConnection(dbUriFor(mongoUri, "test"), {
       maxPoolSize: 3,
       serverSelectionTimeoutMS: 15000,
       family: 4,
@@ -179,7 +179,7 @@ async function initialize() {
     memberSchema.index({ guildId: 1, userId: 1 }, { unique: true });
     Member = memberConn.model("Member", memberSchema);
 
-    const migrated = await migrateFromTeamDb();
+    const migrated = await migrateFromTeamDb(mongoUri);
     if (migrated > 0) {
       console.log(
         `📦 Migrated ${migrated} record(s) from legacy team.members → test.members.`,
