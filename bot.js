@@ -312,6 +312,11 @@ async function syncLeaveLogsFromDb(guild) {
 }
 
 async function syncAllLeaveLogs() {
+  if (!db.isReady()) {
+    console.warn("🏖️ Skipping LeaveLog sync — database is not ready.");
+    return;
+  }
+
   for (const guild of client.guilds.cache.values()) {
     try {
       await syncLeaveLogsFromDb(guild);

@@ -1,5 +1,6 @@
 require("dotenv").config();
 const mongoose = require("mongoose");
+const { resolveMongoUri } = require("./mongoUri");
 
 let Activity,
   ActivityLog,
@@ -10,9 +11,7 @@ let Activity,
 let dbReady = false;
 
 function primaryMongoUri() {
-  const direct = process.env.MONGODB_URI_DIRECT?.trim();
-  if (direct) return direct;
-  return process.env.MONGODB_URI?.trim() || "";
+  return resolveMongoUri("MONGODB_URI", "MONGODB_URI_DIRECT");
 }
 
 function dbUriFor(dbName) {
@@ -86,12 +85,6 @@ async function initialize() {
   const mongoUri = primaryMongoUri();
   if (!mongoUri) {
     throw new Error("MONGODB_URI is not set.");
-  }
-
-  if (mongoUri.startsWith("mongodb+srv://") && !process.env.MONGODB_URI_DIRECT) {
-    console.warn(
-      "[DB] Using mongodb+srv. If you see querySrv ECONNREFUSED, set MONGODB_URI_DIRECT in .env.",
-    );
   }
 
   try {
