@@ -137,7 +137,7 @@ async function syncAllServerMembers(guild) {
   );
 }
 
-// ─── Leave: strip roles, assign FutureRules, restore on end ─────────────────
+// ─── Leave: strip roles, assign FutureRules ───────────────────────────────────
 async function applyLeaveToMember(guild, member, endDate) {
   const guildId = guild.id;
   const userId = member.id;
@@ -264,70 +264,6 @@ async function reconcileAllLeaveStates(guild) {
   }
 }
 
-async function restoreLeaveForMember(guild, member) {
-  const guildId = guild.id;
-  const userId = member.id;
-  const testRecord = await db.getMember(guildId, userId);
-
-  const futureRole = resolveFutureRulesRole(guild);
-  if (futureRole && member.roles.cache.has(futureRole.id)) {
-    await member.roles.remove(futureRole, "Leave ended — restoring roles");
-  }
-
-  const savedRoles = testRecord?.savedRoles || [];
-  const restorable = savedRoles.filter((r) => {
-    const role = guild.roles.cache.get(r.id);
-    return role && !member.roles.cache.has(r.id);
-  });
-
-  if (restorable.length > 0) {
-    await member.roles.add(
-      restorable.map((r) => r.id),
-      "Leave ended — roles restored by QuantumLogics bot",
-    );
-  }
-
-  const refreshed = await guild.members.fetch(userId);
-  const status = computeStatusFromRoles(refreshed);
-
-  await db.upsertMember(guildId, userId, {
-    roles: getMemberRoles(refreshed),
-    savedRoles: [],
-  });
-
-  await db.upsertMember(guildId, userId, {
-    status,
-    leaveEndDate: null,
-  });
-
-  console.log(
-    `✅ Leave ended for ${member.user.tag}. Restored ${restorable.length} role(s). Status: ${status}.`,
-  );
-}
-
-async function processExpiredLeaves() {
-  const today = db.getTodayString();
-
-  for (const guild of client.guilds.cache.values()) {
-    try {
-      const onLeave = await db.getMembersOnLeave(guild.id);
-
-      for (const record of onLeave) {
-        if (!record.leaveEndDate || record.leaveEndDate >= today) continue;
-
-        const member =
-          guild.members.cache.get(record.userId) ||
-          (await guild.members.fetch(record.userId).catch(() => null));
-
-        if (!member) continue;
-        await restoreLeaveForMember(guild, member);
-      }
-    } catch (err) {
-      console.error(`Leave expiry error in guild ${guild.name}:`, err);
-    }
-  }
-}
-
 // ─── On Ready ────────────────────────────────────────────────────────────────
 client.once("ready", async () => {
   console.log(`✅ QuantumLogics Bot is online as ${client.user.tag}`);
@@ -339,7 +275,6 @@ client.once("ready", async () => {
     await reconcileAllLeaveStates(guild);
   }
 
-  await processExpiredLeaves();
   startInactivityChecker();
 
   console.log("⏰ Running startup inactivity check...");
@@ -414,8 +349,7 @@ client.on("interactionCreate", async (interaction) => {
     await interaction.reply({
       content:
         `✅ Leave approved for **${days} day(s)** (until **${leaveInfo.endDate}**).\n` +
-        `Your roles have been saved and **${config.FUTURE_RULES_ROLE}** has been assigned. ` +
-        `Roles will be restored automatically when leave ends.`,
+        `Your roles have been saved and **${config.FUTURE_RULES_ROLE}** has been assigned. Contact an admin when you return to get your roles back.`,
     });
   }
 
@@ -564,11 +498,10 @@ client.on("interactionCreate", async (interaction) => {
     }
 
     await interaction.deferReply({ ephemeral: true });
-    await processExpiredLeaves();
     await checkInactivity();
 
     await interaction.editReply({
-      content: `✅ Done. Processed expired leave and ran inactivity check.\nCheck <#${config.WARNINGS_CHANNEL_ID}> for warnings.`,
+      content: `✅ Done. Ran inactivity check.\nCheck <#${config.WARNINGS_CHANNEL_ID}> for warnings.`,
     });
   }
 
@@ -847,8 +780,7 @@ async function getInactiveDays(guild, member) {
 // ─── Inactivity checker ───────────────────────────────────────────────────────
 function startInactivityChecker() {
   cron.schedule("0 * * * *", async () => {
-    console.log("⏰ Running scheduled checks...");
-    await processExpiredLeaves();
+    console.log("⏰ Running scheduled inactivity check...");
     await checkInactivity();
   });
 }
