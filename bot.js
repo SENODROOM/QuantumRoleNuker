@@ -163,7 +163,7 @@ async function applyLeaveToMember(guild, member, endDate) {
       merged.set(source.id, { id: source.id, name: source.name });
     }
   }
-  savedRoles = [...merged.values()];
+  const savedRoles = [...merged.values()];
 
   await db.upsertMember(guildId, userId, {
     username: freshMember.user.username,
@@ -232,35 +232,85 @@ async function applyLeaveToMember(guild, member, endDate) {
   );
 }
 
-async function reconcileAllLeaveStates(guild) {
-  await guild.members.fetch();
+function memberNeedsLeaveApplied(guild, member, record, leaveLog) {
+  if (!leaveLog) return false;
+
+  if (!record || record.status !== "leave") return true;
+  if (record.leaveEndDate !== leaveLog.endDate) return true;
+
+  const futureRole = resolveFutureRulesRole(guild);
+  const hasRemovableRoles = member.roles.cache.some(
+    (r) =>
+      r.name !== "@everyone" &&
+      !isProtectedRole(r.name) &&
+      !isFutureRulesRole(r.name),
+  );
+
+  if (hasRemovableRoles) return true;
+  if (futureRole && !member.roles.cache.has(futureRole.id)) return true;
+
+  return false;
+}
+
+async function syncLeaveLogsFromDb(guild) {
   await guild.roles.fetch();
 
-  const [teamOnLeave, activeLeaveLogs] = await Promise.all([
-    db.getMembersOnLeave(guild.id),
-    db.getAllActiveLeaves(guild.id),
-  ]);
+  const activeLeaves = await db.getAllActiveLeaves(guild.id);
+  if (!activeLeaves.length) return 0;
 
-  const leaveByUser = new Map();
-  for (const record of teamOnLeave) {
-    if (record.leaveEndDate) leaveByUser.set(record.userId, record.leaveEndDate);
-  }
-  for (const log of activeLeaveLogs) {
-    if (!leaveByUser.has(log.userId)) {
-      leaveByUser.set(log.userId, log.endDate);
+  const latestLeaveByUser = new Map();
+  for (const log of activeLeaves) {
+    const existing = latestLeaveByUser.get(log.userId);
+    if (!existing || log.endDate > existing.endDate) {
+      latestLeaveByUser.set(log.userId, log);
     }
   }
 
-  if (leaveByUser.size === 0) return;
+  let applied = 0;
 
-  console.log(
-    `🏖️ Reconciling leave for ${leaveByUser.size} member(s) in "${guild.name}"...`,
-  );
+  for (const leaveLog of latestLeaveByUser.values()) {
+    try {
+      const member = await guild.members.fetch(leaveLog.userId).catch(() => null);
+      if (!member) {
+        console.warn(
+          `⚠️ LeaveLog for user ${leaveLog.userId} — member not in guild.`,
+        );
+        continue;
+      }
 
-  for (const [userId, endDate] of leaveByUser) {
-    const member = await guild.members.fetch(userId).catch(() => null);
-    if (!member) continue;
-    await applyLeaveToMember(guild, member, endDate);
+      const record = await db.getMember(guild.id, leaveLog.userId);
+
+      if (memberNeedsLeaveApplied(guild, member, record, leaveLog)) {
+        console.log(
+          `🏖️ LeaveLog sync — applying leave for ${member.user.tag} until ${leaveLog.endDate} (source: website/DB).`,
+        );
+        await applyLeaveToMember(guild, member, leaveLog.endDate);
+        applied++;
+      }
+    } catch (err) {
+      console.error(
+        `LeaveLog sync error for user ${leaveLog.userId}:`,
+        err.message,
+      );
+    }
+  }
+
+  if (applied > 0) {
+    console.log(
+      `✅ LeaveLog sync in "${guild.name}" — applied leave actions for ${applied} member(s).`,
+    );
+  }
+
+  return applied;
+}
+
+async function syncAllLeaveLogs() {
+  for (const guild of client.guilds.cache.values()) {
+    try {
+      await syncLeaveLogsFromDb(guild);
+    } catch (err) {
+      console.error(`LeaveLog sync failed for guild ${guild.name}:`, err);
+    }
   }
 }
 
@@ -272,10 +322,11 @@ client.once("ready", async () => {
 
   for (const guild of client.guilds.cache.values()) {
     await syncAllServerMembers(guild);
-    await reconcileAllLeaveStates(guild);
+    await syncLeaveLogsFromDb(guild);
   }
 
   startInactivityChecker();
+  startLeaveLogSync();
 
   console.log("⏰ Running startup inactivity check...");
   await checkInactivity();
@@ -498,10 +549,11 @@ client.on("interactionCreate", async (interaction) => {
     }
 
     await interaction.deferReply({ ephemeral: true });
+    await syncAllLeaveLogs();
     await checkInactivity();
 
     await interaction.editReply({
-      content: `✅ Done. Ran inactivity check.\nCheck <#${config.WARNINGS_CHANNEL_ID}> for warnings.`,
+      content: `✅ Done. Synced LeaveLog entries and ran inactivity check.\nCheck <#${config.WARNINGS_CHANNEL_ID}> for warnings.`,
     });
   }
 
@@ -778,6 +830,13 @@ async function getInactiveDays(guild, member) {
 }
 
 // ─── Inactivity checker ───────────────────────────────────────────────────────
+function startLeaveLogSync() {
+  cron.schedule("*/5 * * * *", async () => {
+    console.log("🏖️ Checking LeaveLog for new website leave entries...");
+    await syncAllLeaveLogs();
+  });
+}
+
 function startInactivityChecker() {
   cron.schedule("0 * * * *", async () => {
     console.log("⏰ Running scheduled inactivity check...");
