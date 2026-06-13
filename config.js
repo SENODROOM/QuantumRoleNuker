@@ -8,6 +8,14 @@ module.exports = {
 
   // ── Protected Roles (never removed) ────────────────────────────────────────
   PROTECTED_ROLES: ["AI/ML", "Web", "Compiler"],
+  // Match by Discord role ID — survives renames; comma-separated in .env
+  PROTECTED_ROLE_IDS: (
+    process.env.PROTECTED_ROLE_IDS ||
+    "1489167743717609593,1494346570932420628,1494346349779488808"
+  )
+    .split(",")
+    .map((id) => id.trim())
+    .filter(Boolean),
 
   // ── Leave role applied while member is on approved leave ───────────────────
   FUTURE_RULES_ROLE: "FutureRules",

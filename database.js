@@ -7,6 +7,9 @@ let Activity,
   LeaveLog,
   Communication,
   Member,
+  Warning,
+  InactiveMember,
+  OnLeave,
   memberConn;
 let dbReady = false;
 
@@ -171,6 +174,7 @@ async function initialize() {
           default: "inactive",
         },
         warningCount: { type: Number, default: 0 },
+        totalWarnings: { type: Number, default: 0 },
         warnedAt: { type: Number, default: null },
         leaveEndDate: { type: String, default: null },
         lastMessageAt: { type: Number, default: null },
@@ -181,6 +185,65 @@ async function initialize() {
     memberSchema.index({ guildId: 1, userId: 1 }, { unique: true });
     Member = memberConn.model("Member", memberSchema);
 
+    const warningSchema = new mongoose.Schema(
+      {
+        guildId: String,
+        userId: String,
+        username: String,
+        globalName: String,
+        inactiveDays: Number,
+        dmSent: { type: Boolean, default: false },
+        channelId: String,
+        channelMessageId: String,
+        type: { type: String, default: "inactivity" },
+        status: {
+          type: String,
+          enum: ["active", "cleared"],
+          default: "active",
+        },
+        clearedAt: { type: Date, default: null },
+        time: { type: Date, default: Date.now },
+      },
+      { collection: "warning", versionKey: "__v" },
+    );
+    warningSchema.index({ guildId: 1, userId: 1, time: -1 });
+    warningSchema.index({ guildId: 1, userId: 1, status: 1 });
+    Warning = memberConn.model("Warning", warningSchema);
+
+    const inactiveMemberSchema = new mongoose.Schema(
+      {
+        guildId: String,
+        userId: String,
+        username: String,
+        globalName: String,
+        rolesRemoved: [{ id: String, name: String }],
+        rolesKept: [{ id: String, name: String }],
+        inactiveDays: Number,
+        reason: { type: String, default: "inactivity" },
+        time: { type: Date, default: Date.now },
+      },
+      { collection: "inactivemembers", versionKey: "__v" },
+    );
+    inactiveMemberSchema.index({ guildId: 1, userId: 1, time: -1 });
+    InactiveMember = memberConn.model("InactiveMember", inactiveMemberSchema);
+
+    const onLeaveSchema = new mongoose.Schema(
+      {
+        guildId: String,
+        userId: String,
+        username: String,
+        globalName: String,
+        startDate: String,
+        endDate: String,
+        savedRoles: [{ id: String, name: String }],
+        source: String,
+        time: { type: Date, default: Date.now },
+      },
+      { collection: "onLeave", versionKey: "__v" },
+    );
+    onLeaveSchema.index({ guildId: 1, userId: 1, endDate: -1 });
+    OnLeave = memberConn.model("OnLeave", onLeaveSchema);
+
     const migrated = await migrateFromTeamDb(mongoUri);
     if (migrated > 0) {
       console.log(
@@ -189,7 +252,9 @@ async function initialize() {
     }
 
     dbReady = true;
-    console.log("📦 Database initialized (test.members, test.communication).");
+    console.log(
+      "📦 Database initialized (test.members, test.communication, warning, inactivemembers, onLeave).",
+    );
     return true;
   } catch (error) {
     dbReady = false;
@@ -252,7 +317,144 @@ async function getMembersOnLeave(guildId) {
 }
 
 async function setWarning(guildId, userId, warningCount, warnedAt) {
-  return upsertMember(guildId, userId, { warningCount, warnedAt });
+  if (!Member) return null;
+  try {
+    const update = {
+      guildId,
+      userId,
+      warningCount,
+      warnedAt,
+      syncedAt: new Date(),
+    };
+    if (warningCount > 0) {
+      return await Member.findOneAndUpdate(
+        { guildId, userId },
+        { $set: update, $inc: { totalWarnings: 1 } },
+        { upsert: true, new: true },
+      );
+    }
+    return await Member.findOneAndUpdate(
+      { guildId, userId },
+      { $set: update },
+      { upsert: true, new: true },
+    );
+  } catch (error) {
+    console.error("Error setting warning:", error);
+    return null;
+  }
+}
+
+async function hasRecentWarning(guildId, userId, hours = 24) {
+  const active = await getActiveWarning(guildId, userId);
+  if (!active) return false;
+  const since = Date.now() - hours * 60 * 60 * 1000;
+  return new Date(active.time).getTime() >= since;
+}
+
+async function getActiveWarning(guildId, userId) {
+  if (!Warning) return null;
+  try {
+    return await Warning.findOne({
+      guildId: String(guildId),
+      userId: String(userId),
+      status: "active",
+    })
+      .sort({ time: -1 })
+      .lean();
+  } catch (error) {
+    console.error("Error getting active warning:", error.message);
+    return null;
+  }
+}
+
+async function hasActiveWarning(guildId, userId) {
+  return !!(await getActiveWarning(guildId, userId));
+}
+
+async function clearActiveWarning(guildId, userId) {
+  if (!Warning) return false;
+  try {
+    await Warning.updateMany(
+      { guildId: String(guildId), userId: String(userId), status: "active" },
+      { $set: { status: "cleared", clearedAt: new Date() } },
+    );
+    await clearWarning(guildId, userId);
+    return true;
+  } catch (error) {
+    console.error("Error clearing active warning:", error.message);
+    return false;
+  }
+}
+
+async function clearActiveWarningIfResponded(guildId, userId) {
+  const active = await getActiveWarning(guildId, userId);
+  if (!active) return false;
+
+  const lastMsg = await getLastCommunicationTime(guildId, userId);
+  if (!lastMsg) return false;
+
+  const warningTime = new Date(active.time).getTime();
+  const daysSinceMsg = Math.floor((Date.now() - lastMsg) / (1000 * 60 * 60 * 24));
+  const respondedAfterWarning = lastMsg >= warningTime;
+  const recentActivity = daysSinceMsg < 3;
+
+  if (respondedAfterWarning || recentActivity) {
+    await clearActiveWarning(guildId, userId);
+    return true;
+  }
+
+  return false;
+}
+
+async function repairWarningState(guildId, userId) {
+  const active = await getActiveWarning(guildId, userId);
+  if (!active?.time || !Member) return false;
+
+  const warnedAt = new Date(active.time).getTime();
+  await Member.findOneAndUpdate(
+    { guildId, userId },
+    { $set: { warningCount: 1, warnedAt, syncedAt: new Date() } },
+  );
+  return true;
+}
+
+async function tryIssueWarning(guildId, userId, warnedAt = Date.now()) {
+  if (!Member) return { issued: false, reason: "db_not_ready" };
+
+  try {
+    if (await hasActiveWarning(guildId, userId)) {
+      return { issued: false, reason: "active_warning" };
+    }
+
+    const existing = await Member.findOne({ guildId, userId });
+    if ((existing?.warningCount || 0) >= 1) {
+      return { issued: false, reason: "already_pending", record: existing };
+    }
+
+    const record = await Member.findOneAndUpdate(
+      { guildId, userId, warningCount: { $lt: 1 } },
+      {
+        $set: {
+          guildId,
+          userId,
+          warningCount: 1,
+          warnedAt,
+          syncedAt: new Date(),
+        },
+        $inc: { totalWarnings: 1 },
+      },
+      { upsert: true, new: true },
+    );
+
+    if (!record) {
+      return { issued: false, reason: "race_lost" };
+    }
+
+    return { issued: true, record };
+  } catch (error) {
+    console.error("Error issuing warning:", error.message);
+    return { issued: false, reason: "error" };
+  }
 }
 
 async function clearWarning(guildId, userId) {
@@ -493,6 +695,104 @@ async function setInternSince(guildId, userId) {
   }
 }
 
+async function recordWarning(data) {
+  if (!Warning) return null;
+  try {
+    return await Warning.create({
+      guildId: data.guildId,
+      userId: data.userId,
+      username: data.username || null,
+      globalName: data.globalName || null,
+      inactiveDays: data.inactiveDays ?? null,
+      dmSent: data.dmSent ?? false,
+      channelId: data.channelId || null,
+      channelMessageId: data.channelMessageId || null,
+      type: data.type || "inactivity",
+      status: "active",
+      clearedAt: null,
+      time: data.time || new Date(),
+    });
+  } catch (error) {
+    console.error("Error recording warning:", error.message);
+    return null;
+  }
+}
+
+async function countWarnings(guildId, userId) {
+  if (!Warning) return 0;
+  try {
+    const count = await Warning.countDocuments({
+      guildId: String(guildId),
+      userId: String(userId),
+    });
+    if (Member && count > 0) {
+      await Member.updateOne(
+        { guildId, userId },
+        { $max: { totalWarnings: count } },
+      );
+    }
+    return count;
+  } catch (error) {
+    console.error("Error counting warnings:", error.message);
+    return 0;
+  }
+}
+
+async function getLatestWarning(guildId, userId) {
+  if (!Warning) return null;
+  try {
+    return await Warning.findOne({
+      guildId: String(guildId),
+      userId: String(userId),
+    })
+      .sort({ time: -1 })
+      .lean();
+  } catch (error) {
+    console.error("Error getting latest warning:", error.message);
+    return null;
+  }
+}
+
+async function recordInactiveMember(data) {
+  if (!InactiveMember) return null;
+  try {
+    return await InactiveMember.create({
+      guildId: data.guildId,
+      userId: data.userId,
+      username: data.username || null,
+      globalName: data.globalName || null,
+      rolesRemoved: data.rolesRemoved || [],
+      rolesKept: data.rolesKept || [],
+      inactiveDays: data.inactiveDays ?? null,
+      reason: data.reason || "inactivity",
+      time: data.time || new Date(),
+    });
+  } catch (error) {
+    console.error("Error recording inactive member:", error.message);
+    return null;
+  }
+}
+
+async function recordOnLeave(data) {
+  if (!OnLeave) return null;
+  try {
+    return await OnLeave.create({
+      guildId: data.guildId,
+      userId: data.userId,
+      username: data.username || null,
+      globalName: data.globalName || null,
+      startDate: data.startDate,
+      endDate: data.endDate,
+      savedRoles: data.savedRoles || [],
+      source: data.source || "bot",
+      time: data.time || new Date(),
+    });
+  } catch (error) {
+    console.error("Error recording onLeave:", error.message);
+    return null;
+  }
+}
+
 module.exports = {
   initialize,
   isReady,
@@ -503,6 +803,13 @@ module.exports = {
   getMembersOnLeave,
   setWarning,
   clearWarning,
+  tryIssueWarning,
+  hasRecentWarning,
+  hasActiveWarning,
+  getActiveWarning,
+  clearActiveWarning,
+  clearActiveWarningIfResponded,
+  repairWarningState,
   recordCommunication,
   markCommunicationDeleted,
   getLastCommunicationTime,
@@ -515,4 +822,9 @@ module.exports = {
   getConsecutiveActiveDays,
   setInternSince,
   getTodayString,
+  recordWarning,
+  recordInactiveMember,
+  recordOnLeave,
+  countWarnings,
+  getLatestWarning,
 };
