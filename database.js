@@ -206,9 +206,11 @@ async function initialize() {
       },
       { collection: "warning", versionKey: "__v" },
     );
-    warningSchema.index({ guildId: 1, userId: 1, time: -1 });
-    warningSchema.index({ guildId: 1, userId: 1, status: 1 });
+    warningSchema.index({ guildId: 1, userId: 1 }, { unique: true });
     Warning = memberConn.model("Warning", warningSchema);
+
+    await dedupeWarningDocuments();
+    await Warning.syncIndexes();
 
     const inactiveMemberSchema = new mongoose.Schema(
       {
@@ -344,62 +346,102 @@ async function setWarning(guildId, userId, warningCount, warnedAt) {
   }
 }
 
-async function hasRecentWarning(guildId, userId, hours = 24) {
-  const active = await getActiveWarning(guildId, userId);
-  if (!active) return false;
-  const since = Date.now() - hours * 60 * 60 * 1000;
-  return new Date(active.time).getTime() >= since;
+function normalizeGuildUserIds(guildId, userId) {
+  return { guildId: String(guildId), userId: String(userId) };
 }
 
-async function getActiveWarning(guildId, userId) {
-  if (!Warning) return null;
+async function dedupeWarningDocuments() {
+  if (!Warning) return 0;
+
   try {
-    return await Warning.findOne({
-      guildId: String(guildId),
-      userId: String(userId),
-      status: "active",
-    })
-      .sort({ time: -1 })
-      .lean();
+    const duplicateGroups = await Warning.aggregate([
+      { $sort: { time: -1 } },
+      {
+        $group: {
+          _id: { guildId: "$guildId", userId: "$userId" },
+          keepId: { $first: "$_id" },
+          allIds: { $push: "$_id" },
+          count: { $sum: 1 },
+        },
+      },
+      { $match: { count: { $gt: 1 } } },
+    ]);
+
+    if (!duplicateGroups.length) return 0;
+
+    const idsToDelete = [];
+    for (const group of duplicateGroups) {
+      for (const id of group.allIds) {
+        if (String(id) !== String(group.keepId)) {
+          idsToDelete.push(id);
+        }
+      }
+    }
+
+    if (!idsToDelete.length) return 0;
+
+    const result = await Warning.deleteMany({ _id: { $in: idsToDelete } });
+    if (result.deletedCount > 0) {
+      console.log(
+        `🧹 Removed ${result.deletedCount} duplicate test.warning row(s).`,
+      );
+    }
+    return result.deletedCount;
   } catch (error) {
-    console.error("Error getting active warning:", error.message);
-    return null;
+    console.error("Error deduping warning documents:", error.message);
+    return 0;
   }
 }
 
-async function hasActiveWarning(guildId, userId) {
-  return !!(await getActiveWarning(guildId, userId));
+async function hasRecentWarning(guildId, userId, hours = 24) {
+  const doc = await getWarningDocument(guildId, userId);
+  if (!doc) return false;
+  const since = Date.now() - hours * 60 * 60 * 1000;
+  return new Date(doc.time).getTime() >= since;
 }
 
-async function clearActiveWarning(guildId, userId) {
+async function getWarningDocument(guildId, userId) {
+  return getLatestWarning(guildId, userId);
+}
+
+async function hasWarningDocument(guildId, userId) {
   if (!Warning) return false;
+  const ids = normalizeGuildUserIds(guildId, userId);
   try {
-    await Warning.updateMany(
-      { guildId: String(guildId), userId: String(userId), status: "active" },
-      { $set: { status: "cleared", clearedAt: new Date() } },
-    );
-    await clearWarning(guildId, userId);
-    return true;
+    const doc = await Warning.findOne(ids).select("_id").lean();
+    return !!doc;
   } catch (error) {
-    console.error("Error clearing active warning:", error.message);
+    console.error("Error checking warning document:", error.message);
     return false;
   }
 }
 
-async function clearActiveWarningIfResponded(guildId, userId) {
-  const active = await getActiveWarning(guildId, userId);
-  if (!active) return false;
+async function removeWarningDocument(guildId, userId) {
+  if (!Warning) return false;
+  const ids = normalizeGuildUserIds(guildId, userId);
+  try {
+    const result = await Warning.deleteOne(ids);
+    if (result.deletedCount > 0) {
+      await clearWarning(guildId, userId);
+      return true;
+    }
+    return false;
+  } catch (error) {
+    console.error("Error removing warning document:", error.message);
+    return false;
+  }
+}
+
+async function clearWarningIfResponded(guildId, userId) {
+  const doc = await getWarningDocument(guildId, userId);
+  if (!doc) return false;
 
   const lastMsg = await getLastCommunicationTime(guildId, userId);
   if (!lastMsg) return false;
 
-  const warningTime = new Date(active.time).getTime();
-  const daysSinceMsg = Math.floor((Date.now() - lastMsg) / (1000 * 60 * 60 * 24));
-  const respondedAfterWarning = lastMsg >= warningTime;
-  const recentActivity = daysSinceMsg < 3;
-
-  if (respondedAfterWarning || recentActivity) {
-    await clearActiveWarning(guildId, userId);
+  const warningTime = new Date(doc.time).getTime();
+  if (lastMsg >= warningTime) {
+    await removeWarningDocument(guildId, userId);
     return true;
   }
 
@@ -407,10 +449,10 @@ async function clearActiveWarningIfResponded(guildId, userId) {
 }
 
 async function repairWarningState(guildId, userId) {
-  const active = await getActiveWarning(guildId, userId);
-  if (!active?.time || !Member) return false;
+  const doc = await getWarningDocument(guildId, userId);
+  if (!doc?.time || !Member) return false;
 
-  const warnedAt = new Date(active.time).getTime();
+  const warnedAt = new Date(doc.time).getTime();
   await Member.findOneAndUpdate(
     { guildId, userId },
     { $set: { warningCount: 1, warnedAt, syncedAt: new Date() } },
@@ -422,13 +464,14 @@ async function tryIssueWarning(guildId, userId, warnedAt = Date.now()) {
   if (!Member) return { issued: false, reason: "db_not_ready" };
 
   try {
-    if (await hasActiveWarning(guildId, userId)) {
-      return { issued: false, reason: "active_warning" };
+    if (await hasWarningDocument(guildId, userId)) {
+      await repairWarningState(guildId, userId);
+      return { issued: false, reason: "warning_document_exists" };
     }
 
     const existing = await Member.findOne({ guildId, userId });
     if ((existing?.warningCount || 0) >= 1) {
-      return { issued: false, reason: "already_pending", record: existing };
+      await clearWarning(guildId, userId);
     }
 
     const record = await Member.findOneAndUpdate(
@@ -487,14 +530,17 @@ async function recordCommunication(message) {
         ? await message.channel.fetch()
         : message.channel;
 
+    const guildId = String(message.guild.id);
+    const userId = String(message.author.id);
+
     await Communication.findOneAndUpdate(
-      { guildId: message.guild.id, messageId: message.id },
+      { guildId, messageId: message.id },
       {
         $set: {
-          guildId: message.guild.id,
+          guildId,
           channelId: channel?.id || message.channelId,
           messageId: message.id,
-          DiscordID: message.author.id,
+          DiscordID: userId,
           time: message.createdAt || new Date(),
           channelName: resolveChannelName(channel),
           status: "active",
@@ -697,10 +743,18 @@ async function setInternSince(guildId, userId) {
 
 async function recordWarning(data) {
   if (!Warning) return null;
+  const ids = normalizeGuildUserIds(data.guildId, data.userId);
   try {
+    if (await hasWarningDocument(ids.guildId, ids.userId)) {
+      console.warn(
+        `Warning document already exists for ${ids.userId} — skipping create`,
+      );
+      return null;
+    }
+
     return await Warning.create({
-      guildId: data.guildId,
-      userId: data.userId,
+      guildId: ids.guildId,
+      userId: ids.userId,
       username: data.username || null,
       globalName: data.globalName || null,
       inactiveDays: data.inactiveDays ?? null,
@@ -713,6 +767,12 @@ async function recordWarning(data) {
       time: data.time || new Date(),
     });
   } catch (error) {
+    if (error.code === 11000) {
+      console.warn(
+        `Duplicate test.warning blocked for ${ids.userId} (unique index).`,
+      );
+      return null;
+    }
     console.error("Error recording warning:", error.message);
     return null;
   }
@@ -740,15 +800,26 @@ async function countWarnings(guildId, userId) {
 
 async function getLatestWarning(guildId, userId) {
   if (!Warning) return null;
+  const ids = normalizeGuildUserIds(guildId, userId);
   try {
-    return await Warning.findOne({
-      guildId: String(guildId),
-      userId: String(userId),
-    })
-      .sort({ time: -1 })
-      .lean();
+    return await Warning.findOne(ids).lean();
   } catch (error) {
     console.error("Error getting latest warning:", error.message);
+    return null;
+  }
+}
+
+async function updateWarningDetails(guildId, userId, data) {
+  if (!Warning) return null;
+  const ids = normalizeGuildUserIds(guildId, userId);
+  try {
+    return await Warning.findOneAndUpdate(
+      ids,
+      { $set: { ...data, status: "active", clearedAt: null } },
+      { new: true },
+    );
+  } catch (error) {
+    console.error("Error updating warning details:", error.message);
     return null;
   }
 }
@@ -805,10 +876,10 @@ module.exports = {
   clearWarning,
   tryIssueWarning,
   hasRecentWarning,
-  hasActiveWarning,
-  getActiveWarning,
-  clearActiveWarning,
-  clearActiveWarningIfResponded,
+  hasWarningDocument,
+  getWarningDocument,
+  removeWarningDocument,
+  clearWarningIfResponded,
   repairWarningState,
   recordCommunication,
   markCommunicationDeleted,
@@ -823,6 +894,7 @@ module.exports = {
   setInternSince,
   getTodayString,
   recordWarning,
+  updateWarningDetails,
   recordInactiveMember,
   recordOnLeave,
   countWarnings,

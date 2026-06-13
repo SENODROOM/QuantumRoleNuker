@@ -418,11 +418,10 @@ client.on("messageCreate", async (message) => {
     return;
   }
 
-  if (await db.clearActiveWarningIfResponded(message.guild.id, message.author.id)) {
-    console.log(
-      `💬 ${message.author.tag} messaged — cleared from active warning (test.warning).`,
-    );
-  }
+  await db.removeWarningDocument(message.guild.id, message.author.id);
+  console.log(
+    `💬 ${message.author.tag} — saved to test.communication, cleared test.warning if present.`,
+  );
 });
 
 client.on("messageDelete", async (message) => {
@@ -491,14 +490,11 @@ client.on("interactionCreate", async (interaction) => {
       ? `<t:${Math.floor(lastMsgTs / 1000)}:R>`
       : "No messages recorded";
     const inactiveDays = await getInactiveDays(interaction.guild, member);
-    const totalWarnings = await db.countWarnings(
+    const pendingWarning = await db.hasWarningDocument(
       interaction.guild.id,
       targetUser.id,
     );
-    const pendingWarning = await db.hasActiveWarning(
-      interaction.guild.id,
-      targetUser.id,
-    );
+    const totalWarnings = record.totalWarnings || 0;
     const latestWarning = await db.getLatestWarning(
       interaction.guild.id,
       targetUser.id,
@@ -579,10 +575,10 @@ client.on("interactionCreate", async (interaction) => {
     }
 
     const user = interaction.options.getUser("user");
-    await db.clearActiveWarning(interaction.guild.id, user.id);
+    await db.removeWarningDocument(interaction.guild.id, user.id);
 
     await interaction.reply({
-      content: `✅ Active warning cleared for <@${user.id}>.`,
+      content: `✅ Warning removed from test.warning for <@${user.id}>.`,
     });
   }
 
@@ -671,11 +667,7 @@ client.on("interactionCreate", async (interaction) => {
     const inactiveDays = member
       ? await getInactiveDays(interaction.guild, member)
       : null;
-    const totalWarnings = await db.countWarnings(
-      interaction.guild.id,
-      targetUser.id,
-    );
-    const activeWarning = await db.getActiveWarning(
+    const warningDoc = await db.getWarningDocument(
       interaction.guild.id,
       targetUser.id,
     );
@@ -691,9 +683,10 @@ client.on("interactionCreate", async (interaction) => {
       content:
         `**🔬 Debug for <@${targetUser.id}>**\n` +
         `**status:** ${record.status}\n` +
-        `**active warning (test.warning):** ${activeWarning ? "yes" : "no"}\n` +
+        `**active warning (test.warning):** ${warningDoc ? "yes" : "no"}\n` +
         `**warningCount (members):** ${record.warningCount}\n` +
-        `**totalWarnings (test.warning):** ${totalWarnings}\n` +
+        `**totalWarnings (lifetime):** ${record.totalWarnings || 0}\n` +
+        `**warning document (test.warning):** ${warningDoc ? "yes" : "no"}\n` +
         `**last warning in DB:** ${latestWarning?.time ? fmt(new Date(latestWarning.time).getTime()) : "none"}\n` +
         `**warnedAt:** ${fmt(record.warnedAt)}\n` +
         `**leaveEndDate:** ${record.leaveEndDate || "none"}\n` +
@@ -742,9 +735,9 @@ client.on("interactionCreate", async (interaction) => {
       });
     }
 
-    if (await db.hasActiveWarning(interaction.guild.id, member.id)) {
+    if (await db.hasWarningDocument(interaction.guild.id, member.id)) {
       return interaction.editReply({
-        content: `❌ <@${member.id}> already has an **active** warning in test.warning.`,
+        content: `❌ <@${member.id}> already has a warning in **test.warning**.`,
       });
     }
 
@@ -755,25 +748,43 @@ client.on("interactionCreate", async (interaction) => {
         1,
         Date.now(),
       );
-      const warningResult = await sendInactivityWarning(interaction.guild, member, {
-        inactiveDays: config.WARN_AFTER_DAYS,
-        totalWarnings: saved?.totalWarnings || 1,
-      });
-      await db.recordWarning({
+
+      const warningRecord = await db.recordWarning({
         guildId: interaction.guild.id,
         userId: member.id,
         username: member.user.username,
         globalName: member.user.globalName || null,
         inactiveDays: config.WARN_AFTER_DAYS,
+        dmSent: false,
+        channelId: null,
+        channelMessageId: null,
+        type: "test_inactivity",
+      });
+
+      if (!warningRecord) {
+        await db.clearWarning(interaction.guild.id, member.id);
+        return interaction.editReply({
+          content: "❌ Could not create test.warning document.",
+        });
+      }
+
+      const warningResult = await sendInactivityWarning(interaction.guild, member, {
+        inactiveDays: config.WARN_AFTER_DAYS,
+        totalWarnings: saved?.totalWarnings || 1,
+      });
+
+      await db.updateWarningDetails(interaction.guild.id, member.id, {
         dmSent: warningResult.dmSent,
         channelId: warningResult.channelId,
         channelMessageId: warningResult.channelMessageId,
-        type: "test_inactivity",
+        inactiveDays: config.WARN_AFTER_DAYS,
       });
+
       await interaction.editReply({
         content: `✅ Test warning sent to ${member} (DM + <#${channel.id}>).`,
       });
     } catch (err) {
+      await db.removeWarningDocument(interaction.guild.id, member.id);
       await interaction.editReply({
         content: `❌ Failed to send warning: ${err.message}`,
       });
@@ -976,22 +987,22 @@ async function checkInactivity() {
             continue;
           }
 
-          const activeWarning = await db.getActiveWarning(guild.id, member.id);
-          if (activeWarning) {
-            if (await db.clearActiveWarningIfResponded(guild.id, member.id)) {
+          const warningDoc = await db.getWarningDocument(guild.id, member.id);
+          if (warningDoc) {
+            if (await db.clearWarningIfResponded(guild.id, member.id)) {
               console.log(
-                `💬 ${member.user.tag} responded recently — cleared active warning.`,
+                `💬 ${member.user.tag} responded recently — removed test.warning document.`,
               );
               skipped++;
               continue;
             }
 
             const hoursSinceWarn =
-              (Date.now() - new Date(activeWarning.time).getTime()) /
+              (Date.now() - new Date(warningDoc.time).getTime()) /
               (1000 * 60 * 60);
 
             console.log(
-              `🔍 ${member.user.tag} — ${inactiveDays}d inactive | active warning | grace: ${hoursSinceWarn.toFixed(1)}h`,
+              `🔍 ${member.user.tag} — ${inactiveDays}d inactive | warning on file | grace: ${hoursSinceWarn.toFixed(1)}h`,
             );
 
             if (hoursSinceWarn < config.WARNING_GRACE_HOURS) {
@@ -1013,8 +1024,13 @@ async function checkInactivity() {
           }
 
           console.log(
-            `🔍 ${member.user.tag} — ${inactiveDays}d inactive | no active warning`,
+            `🔍 ${member.user.tag} — ${inactiveDays}d inactive | no warning document`,
           );
+
+          if (await db.hasWarningDocument(guild.id, member.id)) {
+            skipped++;
+            continue;
+          }
 
           const issue = await db.tryIssueWarning(guild.id, member.id);
           if (!issue.issued) {
@@ -1024,23 +1040,38 @@ async function checkInactivity() {
 
           try {
             const totalWarnings = issue.record?.totalWarnings || 1;
-            const warningResult = await sendInactivityWarning(guild, member, {
-              inactiveDays,
-              totalWarnings,
-            });
-            await db.recordWarning({
+            const saved = await db.recordWarning({
               guildId: guild.id,
               userId: member.id,
               username: member.user.username,
               globalName: member.user.globalName || null,
               inactiveDays,
+              dmSent: false,
+              channelId: null,
+              channelMessageId: null,
+              type: "inactivity",
+            });
+            if (!saved) {
+              await db.clearWarning(guild.id, member.id);
+              skipped++;
+              continue;
+            }
+
+            const warningResult = await sendInactivityWarning(guild, member, {
+              inactiveDays,
+              totalWarnings,
+            });
+
+            await db.updateWarningDetails(guild.id, member.id, {
               dmSent: warningResult.dmSent,
               channelId: warningResult.channelId,
               channelMessageId: warningResult.channelMessageId,
-              type: "inactivity",
+              inactiveDays,
             });
+
             warned++;
           } catch (warnErr) {
+            await db.removeWarningDocument(guild.id, member.id);
             errors++;
             console.error(
               `❌ Failed to warn ${member.user.tag}:`,
@@ -1096,7 +1127,7 @@ async function removeInternshipRoles(guild, member, { inactiveDays = null } = {}
       warnedAt: null,
     });
 
-    await db.clearActiveWarning(guild.id, member.id);
+    await db.removeWarningDocument(guild.id, member.id);
 
     await mainDb.markInactive(
       member.user.username,
