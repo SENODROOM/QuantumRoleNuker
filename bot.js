@@ -220,6 +220,7 @@ async function applyLeaveToMember(guild, member, endDate, { startDate, source } 
     warnedAt: null,
   });
   await db.clearWarning(guildId, userId);
+  await db.removeWarningDocument(guildId, userId);
 
   const rolesToRemove = getRemovableRoles(freshMember);
 
@@ -516,7 +517,7 @@ client.on("interactionCreate", async (interaction) => {
 
     let inactivityLine;
     if (record.status === "leave") {
-      inactivityLine = `⏸️ On leave until **${record.leaveEndDate}**`;
+      inactivityLine = `⏸️ On leave until **${record.leaveEndDate}** (leave days do not count toward inactivity)`;
     } else if (inactiveDays === null) {
       inactivityLine = "—";
     } else if (inactiveDays >= config.WARN_AFTER_DAYS) {

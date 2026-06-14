@@ -601,11 +601,109 @@ async function getLastCommunicationTime(guildId, userId) {
   }
 }
 
+function datesBetweenInclusive(startDateStr, endDateStr) {
+  const dates = [];
+  const cursor = new Date(`${startDateStr}T12:00:00.000Z`);
+  const end = new Date(`${endDateStr}T12:00:00.000Z`);
+
+  while (cursor <= end) {
+    dates.push(toDateString(cursor));
+    cursor.setUTCDate(cursor.getUTCDate() + 1);
+  }
+
+  return dates;
+}
+
+function countPausedLeaveDays(leavePeriods, fromDateStr, toDateStr) {
+  const paused = new Set();
+
+  for (const period of leavePeriods) {
+    if (!period.startDate || !period.endDate) continue;
+
+    const overlapStart =
+      period.startDate > fromDateStr ? period.startDate : fromDateStr;
+    const overlapEnd =
+      period.endDate < toDateStr ? period.endDate : toDateStr;
+
+    if (overlapStart > overlapEnd) continue;
+
+    for (const day of datesBetweenInclusive(overlapStart, overlapEnd)) {
+      paused.add(day);
+    }
+  }
+
+  return paused.size;
+}
+
+async function getApprovedLeavePeriods(guildId, userId, fromDateStr, toDateStr) {
+  const ids = normalizeGuildUserIds(guildId, userId);
+  const periods = [];
+  const seen = new Set();
+
+  const addPeriod = (startDate, endDate) => {
+    if (!startDate || !endDate) return;
+    const key = `${startDate}:${endDate}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    periods.push({ startDate, endDate });
+  };
+
+  try {
+    if (LeaveLog) {
+      const logs = await LeaveLog.find({
+        guildId: ids.guildId,
+        userId: ids.userId,
+        startDate: { $lte: toDateStr },
+        endDate: { $gte: fromDateStr },
+      }).lean();
+
+      for (const log of logs) {
+        addPeriod(log.startDate, log.endDate);
+      }
+    }
+
+    if (OnLeave) {
+      const logs = await OnLeave.find({
+        guildId: ids.guildId,
+        userId: ids.userId,
+        startDate: { $lte: toDateStr },
+        endDate: { $gte: fromDateStr },
+      }).lean();
+
+      for (const log of logs) {
+        addPeriod(log.startDate, log.endDate);
+      }
+    }
+  } catch (error) {
+    console.error("Error getting approved leave periods:", error.message);
+  }
+
+  return periods;
+}
+
 async function getDaysSinceLastMessage(guildId, userId) {
   const lastActive = await getLastCommunicationTime(guildId, userId);
   if (!lastActive) return null;
 
-  return Math.floor((Date.now() - lastActive) / (1000 * 60 * 60 * 24));
+  const rawDays = Math.floor((Date.now() - lastActive) / (1000 * 60 * 60 * 24));
+  if (rawDays <= 0) return 0;
+
+  const inactiveFrom = new Date(lastActive);
+  inactiveFrom.setUTCDate(inactiveFrom.getUTCDate() + 1);
+  const fromDateStr = toDateString(inactiveFrom);
+  const toDateStr = getTodayString();
+
+  if (fromDateStr > toDateStr) return rawDays;
+
+  const leavePeriods = await getApprovedLeavePeriods(
+    guildId,
+    userId,
+    fromDateStr,
+    toDateStr,
+  );
+  const pausedDays = countPausedLeaveDays(leavePeriods, fromDateStr, toDateStr);
+
+  return Math.max(0, rawDays - pausedDays);
 }
 
 async function getAllMembers(guildId) {
